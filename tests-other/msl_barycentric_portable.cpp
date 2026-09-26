@@ -125,7 +125,7 @@ int main(int argc, char **argv)
 {
 	try
 	{
-		check(argc == 10 || argc == 11, "Usage: test portable.spv interpolate.spv block.spv copied_pointer.spv explicit_only.spv mixed_block.spv mixed_frontfacing.spv mixed_builtins.spv per_vertex.spv [output-directory]");
+		check(argc == 11 || argc == 12, "Usage: test portable.spv interpolate.spv block.spv copied_pointer.spv explicit_only.spv mixed_block.spv mixed_frontfacing.spv mixed_builtins.spv multiword_mask.spv per_vertex.spv [output-directory]");
 		auto plain = read_spirv(argv[1]);
 		auto pull = read_spirv(argv[2]);
 		auto block = read_spirv(argv[3]);
@@ -134,8 +134,17 @@ int main(int argc, char **argv)
 		auto mixed_block = read_spirv(argv[6]);
 		auto mixed_frontfacing = read_spirv(argv[7]);
 		auto mixed_builtins = read_spirv(argv[8]);
-		auto per_vertex = read_spirv(argv[9]);
-		std::string directory = argc == 11 ? argv[10] : "";
+		auto multiword_mask = read_spirv(argv[9]);
+		auto per_vertex = read_spirv(argv[10]);
+		std::string directory = argc == 12 ? argv[11] : "";
+		CompilerMSL multiword(multiword_mask);
+		configure(multiword);
+		multiword.set_msl_fragment_barycentric_input(binding());
+		rejects([&]() { multiword.compile(); }, "MSL fragment input blocks with builtin members require a single SampleMask word.");
+		CompilerMSL unsupported_view(mixed_builtins);
+		configure(unsupported_view, "unsupported_view");
+		unsupported_view.set_msl_fragment_barycentric_input(binding());
+		rejects([&]() { unsupported_view.compile(); }, "MSL fragment input blocks with builtin members do not support active builtin 4440.");
 		CompilerMSL facing(mixed_frontfacing);
 		configure(facing);
 		facing.set_msl_fragment_barycentric_input(binding());
@@ -165,18 +174,46 @@ int main(int argc, char **argv)
 			if (std::string(entry) == "loads")
 				check(source.find("interpolant<") == std::string::npos && source.find("user(locn12)") == std::string::npos, "Inactive barycentric members were activated.");
 		}
-		for (const auto &unsupported : {std::make_pair("unsupported", spv::BuiltInClipDistance), std::make_pair("unsupported_helper", spv::BuiltInHelperInvocation), std::make_pair("unsupported_mask", spv::BuiltInSampleMask)})
+		for (const char *entry : {"unsupported", "unsupported_helper", "unsupported_mask", "companions", "companions_only", "demote"})
 			for (bool manual_helper : {false, true})
 			{
 				CompilerMSL compiler(mixed_builtins);
-				configure(compiler, unsupported.first);
+				configure(compiler, entry);
 				auto options = compiler.get_msl_options();
 				options.manual_helper_invocation_updates = manual_helper;
 				compiler.set_msl_options(options);
-				compiler.set_msl_fragment_barycentric_input(binding());
-				auto diagnostic = "Portable barycentric input blocks do not support active builtin " + std::to_string(unsupported.second) + " alongside barycentric members.";
-				rejects([&]() { compiler.compile(); }, diagnostic.c_str());
+				compiler.set_msl_fragment_barycentric_input(std::string(entry) == "companions_only" ? MSLFragmentBarycentricInputBinding{} : binding());
+				auto source = compiler.compile();
+				write_shader(directory, std::string("mixed-") + entry + (manual_helper ? "-manual" : "-native"), source);
+				check(source.find("interpolant<bool") == std::string::npos && source.find("interpolant<uint") == std::string::npos, "Companion builtin acquired interpolation.");
+				if (std::string(entry) == "companions" || std::string(entry) == "companions_only")
+				{
+					for (const char *attribute : {"[[sample_mask]]", "[[primitive_id]]", "[[render_target_array_index]]", "[[viewport_array_index]]", "user(clip0)", "user(clip1)", "user(cull0)", "user(cull1)"})
+						check(source.find(attribute) != std::string::npos, std::string("Missing companion attribute: ") + attribute);
+					check(source.find("out.gl_ClipDistance") == std::string::npos && source.find("out.gl_SampleMask") == std::string::npos, "Input builtin used output storage.");
+				}
+				if (std::string(entry) == "companions_only")
+					check(source.find("user(locn12)") == std::string::npos, "Inactive barycentric member was activated.");
+				if (std::string(entry) == "demote" && manual_helper)
+					check(source.find("gl_HelperInvocation = true") != std::string::npos && source.find("bool& gl_HelperInvocation") != std::string::npos, "Helper demotion state was not shared.");
 			}
+		CompilerMSL masked_companions(mixed_builtins);
+		configure(masked_companions, "companions");
+		auto mask_options = masked_companions.get_msl_options();
+		mask_options.additional_fixed_sample_mask = 3;
+		masked_companions.set_msl_options(mask_options);
+		masked_companions.set_msl_fragment_barycentric_input(binding());
+		decorate(masked_companions, spv::BuiltInBaryCoordKHR, spv::DecorationSample);
+		auto masked_source = masked_companions.compile();
+		write_shader(directory, "mixed-companions-sample-mask", masked_source);
+		check(masked_source.find("gl_SampleMaskIn & 0x3 & (1 << gl_SampleID)") != std::string::npos, "Companion SampleMask lost fixed-mask or sample-rate filtering.");
+		CompilerMSL native_array_mask(mixed_builtins);
+		configure(native_array_mask, "companions");
+		auto native_array_options = native_array_mask.get_msl_options();
+		native_array_options.force_native_arrays = true;
+		native_array_mask.set_msl_options(native_array_options);
+		native_array_mask.set_msl_fragment_barycentric_input(binding());
+		rejects([&]() { native_array_mask.compile(); }, "MSL fragment input blocks with builtin members do not support SampleMask with force_native_arrays.");
 		// Compile both review repros before asserting, so their pre-fix MSL is preserved.
 		CompilerMSL explicit_use(explicit_only), mixed(mixed_block);
 		configure(explicit_use);
@@ -292,7 +329,48 @@ int main(int argc, char **argv)
 		CompilerMSL copied_pointer(copied);
 		configure(copied_pointer);
 		copied_pointer.set_msl_fragment_barycentric_input(binding());
-		rejects([&]() { copied_pointer.compile(); }, "Portable barycentric inputs do not support explicit interpolation through an unresolved input pointer (including OpCopyObject).");
+		auto copied_source = copied_pointer.compile();
+		write_shader(directory, "copied-pointer", copied_source);
+		check(copied_source.find("in.gl_BaryCoordNoPerspEXT.interpolate_at_centroid()") != std::string::npos, "Copied input lost explicit interpolation.");
+		CompilerMSL component_alias(copied);
+		configure(component_alias, "component_alias");
+		component_alias.set_msl_fragment_barycentric_input(binding());
+		auto component_alias_source = component_alias.compile();
+		write_shader(directory, "copied-component-alias", component_alias_source);
+		check(component_alias_source.find("in.gl_BaryCoordNoPerspEXT.interpolate_at_centroid().y") != std::string::npos, "Empty access chain lost the copied scalar component.");
+		for (const char *entry : {"direct_helper", "block_helper", "array_helper"})
+		{
+			CompilerMSL compiler(copied);
+			configure(compiler, entry);
+			compiler.set_msl_fragment_barycentric_input(binding());
+			auto source = compiler.compile();
+			write_shader(directory, std::string("copied-") + entry, source);
+			check(source.find("_m4294967295") == std::string::npos, "Copied input lost its interface index.");
+			if (std::string(entry) != "array_helper")
+			{
+				CompilerMSL missing(copied);
+				configure(missing, entry);
+				missing.set_msl_fragment_barycentric_input({});
+				rejects([&]() { missing.compile(); }, "Portable barycentric inputs require a private Location for each active builtin.");
+				check(compiler.has_active_builtin(spv::BuiltInBaryCoordKHR, spv::StorageClassInput) && compiler.has_active_builtin(spv::BuiltInBaryCoordNoPerspKHR, spv::StorageClassInput), "Copied block input activity was lost.");
+				check(source.find("in.gl_BaryCoordEXT.interpolate_at_centroid().y") != std::string::npos && source.find("in.gl_BaryCoordNoPerspEXT.interpolate_at_sample(1u)") != std::string::npos, "Copied builtin interpolated a different input.");
+				check(source.find("interpolant<float3, interpolation::perspective>") != std::string::npos && source.find("interpolant<float3, interpolation::no_perspective>") != std::string::npos, "Copied input lost interpolation mode.");
+				check(source.find(".interpolate_at_centroid().y") != std::string::npos && source.find(" + 0.4375)[") != std::string::npos && source.find(".interpolate_at_sample(1u)[") != std::string::npos, "Copied scalar lost its interpolation method or component.");
+			}
+			else
+				check(source.find(" + 0.4375).z") != std::string::npos, "Copied array element lost its scalar component.");
+		}
+		CompilerMSL nested_input(copied);
+		configure(nested_input, "nested_array");
+		nested_input.set_msl_fragment_barycentric_input(binding());
+		rejects([&]() { nested_input.compile(); }, "Portable barycentric explicit interpolation does not support nested input composites.");
+		for (const char *entry : {"dynamic_array", "whole_block"})
+		{
+			CompilerMSL compiler(copied);
+			configure(compiler, entry);
+			compiler.set_msl_fragment_barycentric_input(binding());
+			rejects([&]() { compiler.compile(); }, std::string(entry) == "whole_block" ? "MSL fragment input blocks with builtin members require direct member access." : "Trying to dynamically index into an array interface variable using pull-model interpolation. This is currently unsupported.");
+		}
 		for (const char *entry : {"perspective", "no_perspective"})
 		{
 			bool linear = std::string(entry) == "no_perspective";

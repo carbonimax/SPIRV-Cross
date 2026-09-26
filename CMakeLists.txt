@@ -532,7 +532,7 @@ if (SPIRV_CROSS_CLI)
 				set_target_properties(spirv-cross-small-vector-test PROPERTIES LINK_FLAGS "${spirv-cross-link-flags}")
 
 				set(barycentric-fixtures)
-				foreach(fixture portable interpolate block copied_pointer explicit_only mixed_block mixed_frontfacing mixed_builtins)
+				foreach(fixture portable interpolate block copied_pointer explicit_only mixed_block mixed_frontfacing mixed_builtins multiword_mask)
 					set(binary ${CMAKE_CURRENT_BINARY_DIR}/msl_barycentric_${fixture}.spv)
 					add_custom_command(OUTPUT ${binary}
 							COMMAND ${spirv-cross-spirv-as} --target-env vulkan1.1 ${CMAKE_CURRENT_SOURCE_DIR}/tests-other/msl_barycentric_${fixture}.spvasm -o ${binary}

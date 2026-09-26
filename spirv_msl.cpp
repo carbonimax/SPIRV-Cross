@@ -465,6 +465,36 @@ void CompilerMSL::prepare_fragment_barycentric_input()
 		SPIRV_CROSS_THROW("Portable barycentric inputs require a fragment entry point.");
 	if (!msl_options.supports_msl_version(2, 4))
 		SPIRV_CROSS_THROW("Portable barycentric inputs require MSL 2.4 or later.");
+	std::unordered_set<uint32_t> reachable_blocks;
+	for (const auto &cfg : function_cfgs)
+		for (auto block : get<SPIRFunction>(cfg.first).blocks)
+			reachable_blocks.insert(block);
+	std::unordered_map<uint32_t, uint32_t> copied_pointers;
+	ir.for_each_typed_id<SPIRBlock>([&](uint32_t, SPIRBlock &block) {
+		for (auto &instruction : block.ops)
+			if (instruction.op == OpCopyObject)
+			{
+				auto ops = stream(instruction);
+				if (get<SPIRType>(ops[0]).pointer)
+					copied_pointers[ops[1]] = ops[2];
+			}
+	});
+	// Builtin activity analysis sees direct access-chain bases, so resolve
+	// pointer copies before deciding which block members need lowering.
+	ir.for_each_typed_id<SPIRBlock>([&](uint32_t, SPIRBlock &block) {
+		if (!reachable_blocks.count(block.self))
+			return;
+		for (auto &instruction : block.ops)
+		{
+			if (instruction.op != OpAccessChain && instruction.op != OpInBoundsAccessChain)
+				continue;
+			auto ops = stream_mutable(instruction);
+			if (get<SPIRType>(ops[0]).storage == StorageClassInput)
+				while (copied_pointers.count(ops[2]))
+					ops[2] = copied_pointers.at(ops[2]);
+		}
+	});
+	update_active_builtins();
 	// The general builtin analysis misses whole-variable InterpolateAt* operands.
 	// Interface activity already tracks those reads, including reads in helpers.
 	for (auto id : get_active_interface_variables())
@@ -514,6 +544,11 @@ void CompilerMSL::prepare_fragment_barycentric_input()
 					validate(builtin, get<SPIRType>(type.member_types[i]), flags);
 					if (!barycentric_block || is_portable_barycentric(builtin) || !has_active_builtin(builtin, StorageClassInput))
 						continue;
+					const auto &member_type = get<SPIRType>(type.member_types[i]);
+					if (builtin == BuiltInSampleMask && (member_type.array.size() != 1 || !member_type.array_size_literal[0] || member_type.array[0] != 1))
+						SPIRV_CROSS_THROW("MSL fragment input blocks with builtin members require a single SampleMask word.");
+					if (builtin == BuiltInSampleMask && msl_options.force_native_arrays)
+						SPIRV_CROSS_THROW("MSL fragment input blocks with builtin members do not support SampleMask with force_native_arrays.");
 					switch (builtin)
 					{
 					case BuiltInFragCoord:
@@ -521,6 +556,13 @@ void CompilerMSL::prepare_fragment_barycentric_input()
 					case BuiltInPointCoord:
 					case BuiltInSampleId:
 					case BuiltInSamplePosition:
+					case BuiltInHelperInvocation:
+					case BuiltInSampleMask:
+					case BuiltInClipDistance:
+					case BuiltInCullDistance:
+					case BuiltInPrimitiveId:
+					case BuiltInLayer:
+					case BuiltInViewportIndex:
 						builtin_members[builtin] = { type.self, i };
 						break;
 					default:
@@ -552,6 +594,37 @@ void CompilerMSL::prepare_fragment_barycentric_input()
 		fragment_barycentric_builtin_ids[member.first] = var_id;
 		mark_implicit_builtin(StorageClassInput, member.first, var_id);
 	}
+	// Lower member pointers to the ordinary builtin variable before preprocessing
+	// and helper argument extraction. This also preserves the Input storage class.
+	ir.for_each_typed_id<SPIRBlock>([&](uint32_t, SPIRBlock &block) {
+		if (!reachable_blocks.count(block.self))
+			return;
+		for (auto &instruction : block.ops)
+		{
+			if (instruction.op != OpAccessChain && instruction.op != OpInBoundsAccessChain && instruction.op != OpLoad)
+				continue;
+			auto ops = stream_mutable(instruction);
+			uint32_t base = ops[2];
+			while (copied_pointers.count(base))
+				base = copied_pointers.at(base);
+			if (!fragment_barycentric_input_blocks.count(base))
+				continue;
+			const auto &type = get_variable_data_type(get<SPIRVariable>(base));
+			if (instruction.op == OpLoad || !type.array.empty() || instruction.length < 4)
+				SPIRV_CROSS_THROW("MSL fragment input blocks with builtin members require direct member access.");
+			uint32_t member = evaluate_constant_u32(ops[3]);
+			auto builtin = BuiltIn(get_member_decoration(type.self, member, DecorationBuiltIn));
+			auto itr = fragment_barycentric_builtin_ids.find(builtin);
+			if (itr == fragment_barycentric_builtin_ids.end())
+				continue;
+			ops[2] = itr->second;
+			for (uint32_t i = 3; i + 1 < instruction.length; i++)
+				ops[i] = ops[i + 1];
+			instruction.length--;
+			if (instruction.length == 3)
+				instruction.op = OpCopyObject;
+		}
+	});
 }
 
 void CompilerMSL::validate_per_vertex_input_buffer()
@@ -2720,6 +2793,7 @@ void CompilerMSL::extract_global_variables_from_function(uint32_t func_id, std::
 			case OpAccessChain:
 			case OpPtrAccessChain:
 			case OpArrayLength:
+			case OpCopyObject:
 			{
 				uint32_t base_id = ops[2];
 				if (global_var_ids.find(base_id) != global_var_ids.end())
@@ -3141,6 +3215,11 @@ void CompilerMSL::extract_global_variables_from_function(uint32_t func_id, std::
 				{
 					BuiltIn builtin = BuiltInMax;
 					is_builtin = is_member_builtin(*p_type, mbr_idx, &builtin);
+					if (fragment_barycentric_input_blocks.count(arg_id) && fragment_barycentric_builtin_ids.count(builtin))
+					{
+						mbr_idx++;
+						continue;
+					}
 					if (is_builtin && has_active_builtin(builtin, var.storage))
 					{
 						// Add a arg variable with the same type and decorations as the member
@@ -4729,6 +4808,8 @@ void CompilerMSL::add_variable_to_interface_block(StorageClass storage, const st
 					builtin = BuiltInMax;
 					is_builtin = is_member_builtin(var_type, mbr_idx, &builtin);
 					auto &mbr_type = get<SPIRType>(var_type.member_types[mbr_idx]);
+					if (storage == StorageClassInput && fragment_barycentric_input_blocks.count(var.self) && fragment_barycentric_builtin_ids.count(builtin))
+						continue;
 
 					if (storage == StorageClassOutput && is_stage_output_block_member_masked(var, mbr_idx, meta.strip_array))
 					{
@@ -10244,7 +10325,7 @@ void CompilerMSL::fix_up_interpolant_access_chain(const uint32_t *ops, uint32_t 
 	uint32_t interface_index;
 	auto &var_type = get_variable_data_type(*var);
 	auto &result_type = get<SPIRType>(ops[0]);
-	auto *type = &var_type;
+	auto *type = &get_pointee_type(expression_type(ops[2]));
 	if (has_extended_decoration(ops[2], SPIRVCrossDecorationInterfaceMemberIndex))
 	{
 		interface_index = get_extended_decoration(ops[2], SPIRVCrossDecorationInterfaceMemberIndex);
@@ -10252,15 +10333,24 @@ void CompilerMSL::fix_up_interpolant_access_chain(const uint32_t *ops, uint32_t 
 	else
 	{
 		// Assume an access chain into a struct variable.
+		if (fragment_barycentric_input_enabled && (var_type.basetype != SPIRType::Struct || length <= 3 + var_type.array.size()))
+			SPIRV_CROSS_THROW("Portable barycentric explicit interpolation requires a resolved input member.");
 		assert(var_type.basetype == SPIRType::Struct);
 		auto &c = get<SPIRConstant>(ops[3 + var_type.array.size()]);
+		if (fragment_barycentric_input_enabled && !has_extended_member_decoration(var->self, c.scalar(), SPIRVCrossDecorationInterfaceMemberIndex))
+			SPIRV_CROSS_THROW("Portable barycentric explicit interpolation requires a resolved input member.");
 		interface_index =
 		    get_extended_member_decoration(var->self, c.scalar(), SPIRVCrossDecorationInterfaceMemberIndex);
 	}
 	// Accumulate indices. We'll have to skip over the one for the struct, if present, because we already accounted
 	// for that getting the base index.
+	if (has_extended_decoration(ops[2], SPIRVCrossDecorationInterpolantComponentExpr))
+		set_extended_decoration(ops[1], SPIRVCrossDecorationInterpolantComponentExpr, get_extended_decoration(ops[2], SPIRVCrossDecorationInterpolantComponentExpr));
 	for (uint32_t i = 3; i < length; ++i)
 	{
+		// ponytail: reject nested offsets until pull-model lowering tracks composite strides.
+		if (fragment_barycentric_input_enabled && (type->array.size() > 1 || (!type->array.empty() && (type->columns > 1 || type->basetype == SPIRType::Struct)) || (type->basetype == SPIRType::Struct && (i != 3 || has_extended_decoration(ops[2], SPIRVCrossDecorationInterfaceMemberIndex)))))
+			SPIRV_CROSS_THROW("Portable barycentric explicit interpolation does not support nested input composites.");
 		if (is_vector(*type) && !is_array(*type) && is_scalar(result_type))
 		{
 			// We don't want to combine the next index. Actually, we need to save it
@@ -10559,6 +10649,21 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
 
 	switch (opcode)
 	{
+	case OpCopyObject:
+		CompilerGLSL::emit_instruction(instruction);
+		if (get<SPIRType>(ops[0]).pointer)
+		{
+			// Preserve an lvalue even when the backing builtin has a remapped type.
+			if (auto *expr = maybe_get<SPIRExpression>(ops[1]))
+				expr->access_chain = !should_dereference(ops[2]);
+			if (has_decoration(ops[2], DecorationBuiltIn))
+				set_decoration(ops[1], DecorationBuiltIn, get_decoration(ops[2], DecorationBuiltIn));
+			for (auto decoration : { SPIRVCrossDecorationInterfaceMemberIndex, SPIRVCrossDecorationInterpolantComponentExpr })
+				if (has_extended_decoration(ops[2], decoration))
+					set_extended_decoration(ops[1], decoration, get_extended_decoration(ops[2], decoration));
+		}
+		break;
+
 	case OpLoad:
 	{
 		uint32_t id = ops[1];
@@ -12698,6 +12803,8 @@ const char *CompilerMSL::get_memory_order(uint32_t)
 void CompilerMSL::emit_glsl_op(uint32_t result_type, uint32_t id, uint32_t eop, const uint32_t *args, uint32_t count)
 {
 	auto op = static_cast<GLSLstd450>(eop);
+	if (fragment_barycentric_input_enabled && (op == GLSLstd450InterpolateAtCentroid || op == GLSLstd450InterpolateAtSample || op == GLSLstd450InterpolateAtOffset) && !has_extended_decoration(args[0], SPIRVCrossDecorationInterfaceMemberIndex))
+		SPIRV_CROSS_THROW("Portable barycentric explicit interpolation requires a resolved input member.");
 
 	// If we need to do implicit bitcasts, make sure we do it with the correct type.
 	uint32_t integer_width = get_integer_width_for_glsl_instruction(op, args, count);
@@ -17539,6 +17646,8 @@ string CompilerMSL::argument_decl(const SPIRFunction::Parameter &arg)
 			}
 		}
 	}
+	else if (builtin && builtin_type == BuiltInSampleMask && type_storage == StorageClassInput)
+		decl += join(" ", to_expression(name_id));
 	else if (is_array(type) && !type_is_image)
 	{
 		// Arrays of opaque types are special cased.
@@ -20349,6 +20458,14 @@ bool CompilerMSL::OpCodePreprocessor::handle(Op opcode, const uint32_t *args, ui
 		self.ir.ids[id].set_allow_type_rewrite();
 		break;
 	}
+	case OpCopyObject:
+		if (self.get<SPIRType>(args[0]).pointer)
+		{
+			set<SPIRExpression>(args[1], "", args[0], true);
+			self.register_read(args[1], args[2], true);
+			self.ir.ids[args[1]].set_allow_type_rewrite();
+		}
+		break;
 
 	case OpBitcast:
 	case OpConvertPtrToU:
@@ -20391,7 +20508,7 @@ bool CompilerMSL::OpCodePreprocessor::handle(Op opcode, const uint32_t *args, ui
 				// due to the way pull-model interpolation works in Metal.
 				auto *var = self.maybe_get_backing_variable(args[4]);
 				if (!var && self.fragment_barycentric_input_enabled && (self.has_active_builtin(BuiltInBaryCoordKHR, StorageClassInput) || self.has_active_builtin(BuiltInBaryCoordNoPerspKHR, StorageClassInput)))
-					SPIRV_CROSS_THROW("Portable barycentric inputs do not support explicit interpolation through an unresolved input pointer (including OpCopyObject).");
+					SPIRV_CROSS_THROW("Portable barycentric inputs do not support explicit interpolation through an unresolved input pointer.");
 				if (var)
 				{
 					self.pull_model_inputs.insert(var->self);
