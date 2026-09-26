@@ -26,13 +26,15 @@ The captured struct cannot simply be returned unchanged. Its members can be pack
 
 ## Buffer ABI
 
-All buffer indices are explicit, distinct Metal slots in [0, 30]. The only emitted resources are these three classic buffers, even if application argument buffers are enabled; application binding slots can be reused because their resources are absent. Options requiring additional implicit replay resources are rejected. Bind buffer bases with alignment at least 4. `primitive_index_location` must be unused in both the captured layout and raster interface, and must equal the portable fragment binding's private location.
+All buffer indices are explicit, distinct Metal slots in [0, 30]. By default the only emitted resources are these three classic buffers, even if application argument buffers are enabled; application binding slots can be reused because their resources are absent. Reversed-depth viewport emulation optionally adds the mask buffer described below. Bind buffer bases with alignment at least 4. `primitive_index_location` must be unused in both the captured layout and raster interface, and must equal the portable fragment binding's private location.
 
 | Resource | Representation |
 | --- | --- |
 | Captured records | Read-only bytes; `layout.stride` and scalar offsets/types from the producer getter. |
 | Replay occurrences | Read-only tightly packed uint32 pairs: `(absolute_record_index, absolute_primitive_key)`, **8 bytes** per occurrence. |
 | Draw parameters | Four uint32 scalars, **16 bytes**: `(occurrence_base, vertex_id_origin, instance_id_origin, occurrences_per_instance)`. |
+
+When `CompilerMSL::Options::emulate_reversed_depth_viewport` is true, set the existing `Options::reversed_depth_viewport_buffer_index` to the desired mask slot (the existing option default is 18). Replay emits `constant uint& spvEmulatedReversedDepthViewportMask [[buffer(N)]]`, matching the ordinary VS: one **4-byte uint32** mask, bit `v` indicating reversed depth for viewport `v`. The slot must be in [0, 30] and distinct from the captured-record, occurrence and draw-parameter slots; collisions and out-of-range values (including `~0u`) throw `CompilerError`. No automatic slot allocation or additional replay binding field is introduced. When emulation is false, the mask index is ignored, no mask argument or correction is emitted, and the existing three-buffer ABI and generated source are unchanged.
 
 With Metal's actual `vertex_id` and `instance_id`, use unsigned 64-bit address arithmetic:
 
@@ -51,7 +53,7 @@ The caller guarantees IDs are at least their origins, address arithmetic does no
 
 ## Fixups and initial limits
 
-Capture skips `CompilerMSL::emit_fixup()`, including clip-space conversion, Y inversion, default PointSize and depth/viewport emulation. Replay applies `Options::vertex.fixup_clipspace` and `Options::vertex.flip_vert_y` **exactly once**, after loading captured Position, by calling the existing raster fixup emitter. It never invokes application output hooks. Runtime-dependent depth/viewport emulation and `enable_point_size_default` are explicitly rejected. A captured application PointSize is supported; missing outputs are not silently synthesized.
+Capture skips `CompilerMSL::emit_fixup()`, including clip-space conversion, Y inversion, default PointSize and depth/viewport emulation. Replay calls this same raster fixup emitter **exactly once** after loading captured outputs: optional `Options::vertex.fixup_clipspace`, optional reversed-depth correction, then optional `Options::vertex.flip_vert_y`. Reversed-depth correction is `Position.z = Position.w - Position.z` when the selected mask bit is set. It uses `uint(ViewportIndex)` from the captured output if present, otherwise bit zero (also when ViewportIndex is masked). The caller must supply a device-valid viewport index below 32 and bind the same mask as an equivalent ordinary VS draw; no index clamping or mask inference is performed. This supports the existing emulation path on older AMD Mac2 without requiring MSL 4.0. It never invokes application output hooks. `emulate_depth_clip_enable`, multiview and `enable_point_size_default` remain explicitly rejected. A captured application PointSize is supported; missing outputs are not silently synthesized.
 
 Implemented subset:
 
@@ -65,7 +67,7 @@ The runtime owns topology/restart/degenerate handling, provoking vertex order, o
 
 ## CPU and Metal checks
 
-`spirv-cross-msl-capture-replay-test` is a native C++ project target registered with CTest. It checks simple/complex capture, normal raster and replay shaders with both native/default arrays and vertex/compute capture. Interfaces are compared after removing the private key. The side-effect fixture has a positive control atomic SSBO write in capture, absent from replay along with the application resource and helper. It also covers masks, builtin remapping, ClipDistance aliases, all four clip-space/Y combinations, and invalid layouts/bindings/options/compiler reuse/stages.
+`spirv-cross-msl-capture-replay-test` is a native C++ project target registered with CTest. It checks simple/complex capture, normal raster and replay shaders with both native/default arrays and vertex/compute capture. Interfaces are compared after removing the private key. The side-effect fixture has a positive control atomic SSBO write in capture, absent from replay along with the application resource and helper. It also covers masks, builtin remapping, ClipDistance aliases, all four clip-space/Y combinations, and invalid layouts/bindings/options/compiler reuse/stages. Reversed-depth cases compare ordinary VS and replay mask arguments, guards, correction count and fixup order for absent and captured ViewportIndex, with vertex/compute capture and all clip-space/Y combinations. A separate replay check masks ViewportIndex from a complete captured layout and verifies viewport-zero selection. Capture must emit neither the mask nor raster fixups. Slot 30 proves explicit non-default binding; all three collisions, slot 31 and `~0u` must fail only when emulation is enabled. Disabled variants must match the default replay source exactly.
 
 ```sh
 glslangValidator -V --target-env vulkan1.1 tests-other/msl_capture_replay_effects.vert -o tests-other/msl_capture_replay_effects.spv
@@ -79,4 +81,4 @@ for shader in OUT/*.metal; do
 done
 ```
 
-The test writes 49 MSL shaders: capture, normal raster and replay variants, plus four fixup variants. These syntax checks and the existing layout/fragment tests pass; GPU replay execution and MoltenVK integration remain separate validation work. TES is a rejection fixture, not a supported replay stage.
+The test writes 98 MSL shaders: the original 49 capture, normal raster, replay and fixup variants, plus 48 reversed-depth capture/ordinary/replay variants and one masked-ViewportIndex replay. These are CPU code-generation and MSL 2.4 syntax checks; they do not establish AMD Mac2 pipeline creation or GPU replay execution. MoltenVK integration remains separate validation work. TES is a rejection fixture, not a supported replay stage.
