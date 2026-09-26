@@ -112,6 +112,14 @@ struct MSLCapturedVertexLayout
 	std::vector<MSLCapturedVertexBuiltin> builtins;
 };
 
+struct MSLCapturedOutputReplayBinding
+{
+	uint32_t vertex_buffer_index = ~0u;
+	uint32_t occurrence_buffer_index = ~0u;
+	uint32_t draw_parameters_buffer_index = ~0u;
+	uint32_t primitive_index_location = ~0u;
+};
+
 struct MSLPerVertexInputBinding
 {
 	uint32_t vertex_buffer_index = ~0u;
@@ -734,6 +742,16 @@ public:
 	// unflattened user composites and non-16/32-bit numeric fields). Does not infer draw indexing.
 	MSLCapturedVertexLayout get_msl_captured_vertex_layout() const;
 
+	// Compile a rasterizing vertex replay on a fresh compiler configured with the original SPIR-V.
+	// Emits only captured scalar loads, the normal output interface and a private flat uint key.
+	// Occurrences are packed uint32 (record, primitive key) pairs, 8 bytes each.
+	// Draw parameters are four uint32: occurrence base, vertex ID origin, instance ID origin,
+	// occurrences per instance. Occurrence = base + (instance_id - origin) * stride + vertex_id - origin.
+	// Buffer bases must be aligned to 4 bytes; caller owns bounds, topology, indices and visibility.
+	// MSL >= 2.4, vertex only; unsupported output shapes, builtins and rasterization options throw.
+	// Consumes this compiler even on failure. Does not emit application resources or function bodies.
+	std::string compile_captured_output_replay(const MSLCapturedVertexLayout &layout, const MSLCapturedOutputReplayBinding &binding);
+
 	// Opt in to portable fragment PerVertexKHR inputs (MSL >= 2.4).
 	// Mutually exclusive with supports_per_vertex_fragment_input for active PerVertex inputs.
 	// Only variable-decorated arrays of 1-3 scalar/vector values are supported; no composites.
@@ -1059,6 +1077,7 @@ protected:
 
 	void replace_illegal_entry_point_names();
 	void sync_entry_point_aliases_and_names();
+	void configure_msl_backend();
 
 	static const std::unordered_set<std::string> &get_reserved_keyword_set();
 	static const std::unordered_set<std::string> &get_illegal_func_names();
@@ -1116,6 +1135,9 @@ protected:
 	MSLPerVertexInputBinding per_vertex_input_binding;
 	std::map<LocationComponentPair, MSLCapturedVertexComponent> per_vertex_input_components;
 	bool msl_compile_completed = false;
+	bool msl_compile_started = false;
+	bool captured_output_replay = false;
+	uint32_t captured_output_replay_key_member = ~0u;
 	std::map<uint32_t, uint32_t> captured_output_component_masks;
 	bool per_vertex_input_buffer_enabled = false;
 	bool per_vertex_input_buffer_used = false;

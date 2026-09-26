@@ -531,6 +531,12 @@ if (SPIRV_CROSS_CLI)
 				target_link_libraries(spirv-cross-small-vector-test spirv-cross-core)
 				set_target_properties(spirv-cross-small-vector-test PROPERTIES LINK_FLAGS "${spirv-cross-link-flags}")
 
+				add_executable(spirv-cross-msl-capture-replay-test tests-other/msl_capture_replay.cpp)
+				target_link_libraries(spirv-cross-msl-capture-replay-test spirv-cross-msl)
+				set_target_properties(spirv-cross-msl-capture-replay-test PROPERTIES LINK_FLAGS "${spirv-cross-link-flags}")
+				add_test(NAME spirv-cross-msl-capture-replay-test
+						COMMAND $<TARGET_FILE:spirv-cross-msl-capture-replay-test> ${CMAKE_CURRENT_SOURCE_DIR}/tests-other/msl_capture_layout_simple.spv ${CMAKE_CURRENT_SOURCE_DIR}/tests-other/msl_capture_layout_complex.spv ${CMAKE_CURRENT_SOURCE_DIR}/tests-other/msl_capture_replay_effects.spv ${CMAKE_CURRENT_SOURCE_DIR}/tests-other/msl_capture_replay_unsupported.spv ${CMAKE_CURRENT_SOURCE_DIR}/tests-other/msl_capture_layout_unsupported.spv)
+
 				add_executable(spirv-cross-msl-capture-layout-test tests-other/msl_capture_layout.cpp)
 				target_link_libraries(spirv-cross-msl-capture-layout-test spirv-cross-msl)
 				set_target_properties(spirv-cross-msl-capture-layout-test PROPERTIES LINK_FLAGS "${spirv-cross-link-flags}")

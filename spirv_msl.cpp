@@ -156,6 +156,195 @@ MSLCapturedVertexLayout CompilerMSL::get_msl_captured_vertex_layout() const
 	return layout;
 }
 
+string CompilerMSL::compile_captured_output_replay(const MSLCapturedVertexLayout &layout, const MSLCapturedOutputReplayBinding &binding)
+{
+	if (msl_compile_started)
+		SPIRV_CROSS_THROW("Captured output replay requires a fresh compiler with the original SPIR-V.");
+	msl_compile_started = true;
+	captured_output_replay = true;
+	if (get_execution_model() != ExecutionModelVertex)
+		SPIRV_CROSS_THROW("Captured output replay supports only vertex entry points, not tessellation or mesh stages.");
+	if (!msl_options.supports_msl_version(2, 4))
+		SPIRV_CROSS_THROW("Captured output replay requires MSL 2.4 or later.");
+	if (msl_options.capture_output_to_buffer || msl_options.vertex_for_tessellation || msl_options.disable_rasterization)
+		SPIRV_CROSS_THROW("Captured output replay requires a normal rasterizing vertex configuration.");
+	if (msl_options.multiview || msl_options.view_index_from_device_index || msl_options.emulate_depth_clip_enable || msl_options.emulate_reversed_depth_viewport || msl_options.enable_point_size_default)
+		SPIRV_CROSS_THROW("Captured output replay does not support multiview, depth/viewport emulation or synthesized default PointSize.");
+	if (binding.vertex_buffer_index > 30 || binding.occurrence_buffer_index > 30 || binding.draw_parameters_buffer_index > 30 || binding.vertex_buffer_index == binding.occurrence_buffer_index || binding.vertex_buffer_index == binding.draw_parameters_buffer_index || binding.occurrence_buffer_index == binding.draw_parameters_buffer_index)
+		SPIRV_CROSS_THROW("Captured output replay requires three distinct Metal buffer indices in [0, 30].");
+	if (binding.primitive_index_location == k_unknown_location || !layout.stride)
+		SPIRV_CROSS_THROW("Captured output replay requires a private Location and nonzero captured stride.");
+
+	std::map<LocationComponentPair, MSLCapturedVertexComponent> components;
+	std::map<std::tuple<BuiltIn, uint32_t, uint32_t>, MSLCapturedVertexBuiltin> builtins;
+	std::map<uint32_t, uint32_t> ranges;
+	auto validate_scalar = [&](SPIRType::BaseType scalar_type, uint32_t offset) {
+		uint32_t size = 0;
+		switch (scalar_type)
+		{
+		case SPIRType::Half: case SPIRType::Short: case SPIRType::UShort: size = 2; break;
+		case SPIRType::Float: case SPIRType::Int: case SPIRType::UInt: size = 4; break;
+		default: SPIRV_CROSS_THROW("Captured output replay requires 16/32-bit numeric scalar types.");
+		}
+		if (offset % size || layout.stride % size)
+			SPIRV_CROSS_THROW("Captured output replay scalar offsets and stride must be naturally aligned.");
+		if (size > layout.stride || offset > layout.stride - size)
+			SPIRV_CROSS_THROW("Captured output replay scalar lies outside the captured stride.");
+		auto next = ranges.lower_bound(offset);
+		if ((next != ranges.end() && next->first < offset + size) || (next != ranges.begin() && std::prev(next)->second > offset))
+			SPIRV_CROSS_THROW("Captured output replay layout has overlapping scalar offsets.");
+		ranges.emplace(offset, offset + size);
+	};
+	for (const auto &field : layout.components)
+	{
+		if (field.location == k_unknown_location || field.component > 3)
+			SPIRV_CROSS_THROW("Captured output replay layout has invalid Location/Component.");
+		if (field.location == binding.primitive_index_location)
+			SPIRV_CROSS_THROW("Captured output replay private Location collides with the captured layout.");
+		if (!components.emplace(LocationComponentPair{field.location, field.component}, field).second)
+			SPIRV_CROSS_THROW("Captured output replay layout has duplicate Location/Component.");
+		validate_scalar(field.scalar_type, field.byte_offset);
+	}
+	auto supported_builtin = [](BuiltIn builtin) {
+		return builtin == BuiltInPosition || builtin == BuiltInPointSize || builtin == BuiltInClipDistance || builtin == BuiltInLayer || builtin == BuiltInViewportIndex;
+	};
+	for (const auto &field : layout.builtins)
+	{
+		if (!supported_builtin(field.builtin))
+			SPIRV_CROSS_THROW(join("Captured output replay does not support builtin ", uint32_t(field.builtin), "."));
+		bool is_uint = field.builtin == BuiltInLayer || field.builtin == BuiltInViewportIndex;
+		if (field.scalar_type != (is_uint ? SPIRType::UInt : SPIRType::Float) || (field.builtin != BuiltInClipDistance && field.array_index) || field.component >= (field.builtin == BuiltInPosition ? 4u : 1u))
+			SPIRV_CROSS_THROW("Captured output replay builtin has an unsupported type or shape.");
+		if (!builtins.emplace(std::make_tuple(field.builtin, field.array_index, field.component), field).second)
+			SPIRV_CROSS_THROW("Captured output replay layout has duplicate builtin array element/component.");
+		validate_scalar(field.scalar_type, field.byte_offset);
+	}
+
+	configure_msl_backend();
+	fixup_anonymous_struct_names();
+	fixup_type_alias();
+	replace_illegal_names();
+	sync_entry_point_aliases_and_names();
+	build_function_control_flow_graphs_and_analyze();
+	update_active_builtins();
+	active_output_builtins.for_each_bit([&](uint32_t builtin) {
+		if (!supported_builtin(BuiltIn(builtin)))
+			SPIRV_CROSS_THROW(join("Captured output replay does not support output builtin ", builtin, "."));
+	});
+	set_enabled_interface_variables(get_active_interface_variables());
+	// Only plain interface blocks are supported. Do not accidentally accept arrays/matrices
+	// just because the raster interface builder can flatten them, unlike the capture layout.
+	ir.for_each_typed_id<SPIRVariable>([&](uint32_t, const SPIRVariable &var) {
+		if (var.storage != StorageClassOutput || !interface_variable_exists_in_entry_point(var.self))
+			return;
+		const auto &type = get_variable_data_type(var);
+		auto check_user_type = [](const SPIRType &member) {
+			if (member.pointer || !member.array.empty() || member.columns != 1 || member.basetype == SPIRType::Struct)
+				SPIRV_CROSS_THROW("Captured output replay does not support user arrays, matrices or nested structs.");
+		};
+		if (type.basetype == SPIRType::Struct && has_decoration(type.self, DecorationBlock) && type.array.empty())
+		{
+			for (uint32_t i = 0; i < type.member_types.size(); i++)
+				if (!has_member_decoration(type.self, i, DecorationBuiltIn))
+					check_user_type(get<SPIRType>(type.member_types[i]));
+		}
+		else if (!is_builtin_variable(var))
+			check_user_type(type);
+	});
+	capture_output_to_buffer = false;
+	is_rasterization_disabled = false;
+	stage_out_var_id = add_interface_block(StorageClassOutput);
+	if (!stage_out_var_id || qual_pos_var_name.empty())
+		SPIRV_CROSS_THROW("Captured output replay requires a Position output.");
+	auto &output = get<SPIRType>(get_variable_data_type_id(get<SPIRVariable>(stage_out_var_id)));
+	for (uint32_t i = 0; i < output.member_types.size(); i++)
+		if (!has_member_decoration(output.self, i, DecorationBuiltIn) && get_member_location(output.self, i) == binding.primitive_index_location)
+			SPIRV_CROSS_THROW("Captured output replay private Location collides with the raster output interface.");
+
+	uint32_t uint_id = ir.increase_bound_by(1);
+	auto &uint_type = set<SPIRType>(uint_id, OpTypeInt);
+	uint_type.basetype = SPIRType::UInt;
+	uint_type.width = 32;
+	uint32_t key_member = uint32_t(output.member_types.size());
+	captured_output_replay_key_member = key_member;
+	output.member_types.push_back(uint_id);
+	set_member_name(output.self, key_member, "spvReplayPrimitive");
+	set_member_decoration(output.self, key_member, DecorationLocation, binding.primitive_index_location);
+	set_member_decoration(output.self, key_member, DecorationFlat);
+	// Do not emit resources, application functions or interface fixup hooks. Those hooks
+	// contain application stores and flattening operations, not just rasterization fixups.
+	buffer.reset();
+	emit_header();
+	emit_struct(output);
+	statement("vertex ", type_to_glsl(output), " ", to_name(ir.default_entry_point), "(uint spvReplayVertex [[vertex_id]], uint spvReplayInstance [[instance_id]], const device uchar* spvReplayVertices [[buffer(", binding.vertex_buffer_index, ")]], const device uint* spvReplayOccurrences [[buffer(", binding.occurrence_buffer_index, ")]], constant uint* spvReplayDraw [[buffer(", binding.draw_parameters_buffer_index, ")]])");
+	begin_scope();
+	statement(type_to_glsl(output), " ", stage_out_var_name, ";");
+	statement("ulong spvReplayOccurrence = ulong(spvReplayDraw[0]) + (ulong(spvReplayInstance) - ulong(spvReplayDraw[2])) * ulong(spvReplayDraw[3]) + (ulong(spvReplayVertex) - ulong(spvReplayDraw[1]));");
+	statement("const device uchar* spvReplayRecord = spvReplayVertices + ulong(spvReplayOccurrences[2ul * spvReplayOccurrence]) * ", layout.stride, "ul;");
+	for (uint32_t i = 0; i < key_member; i++)
+	{
+		const auto &type = get<SPIRType>(get_physical_member_type_id(output, i));
+		bool builtin = has_member_decoration(output.self, i, DecorationBuiltIn);
+		if (type.pointer || type.columns != 1 || !type.vecsize || type.vecsize > 4 || type.array.size() > 1 || (!builtin && !type.array.empty()))
+			SPIRV_CROSS_THROW("Captured output replay has an unsupported physical output shape.");
+		uint32_t count = 1;
+		if (!type.array.empty())
+		{
+			if (!type.array_size_literal[0] || !type.array[0])
+				SPIRV_CROSS_THROW("Captured output replay requires literal nonzero builtin array sizes.");
+			count = type.array[0];
+		}
+		uint32_t component = 0;
+		uint32_t location = get_member_location(output.self, i, &component);
+		if (component == k_unknown_component)
+			component = 0;
+		if (!builtin && (location == k_unknown_location || component > 3 || type.vecsize > 4 - component))
+			SPIRV_CROSS_THROW("Captured output replay has an unrepresentable output Location/Component.");
+		for (uint32_t a = 0; a < count; a++)
+			for (uint32_t c = 0; c < type.vecsize; c++)
+			{
+				uint32_t offset;
+				SPIRType::BaseType scalar_type;
+				if (builtin)
+				{
+					auto bi = BuiltIn(get_member_decoration(output.self, i, DecorationBuiltIn));
+					uint32_t first = get_member_decoration(output.self, i, DecorationIndex);
+					if (first > UINT32_MAX - a)
+						SPIRV_CROSS_THROW("Captured output replay builtin array index overflows.");
+					auto field = builtins.find(std::make_tuple(bi, first + a, c));
+					if (field == builtins.end())
+						SPIRV_CROSS_THROW(join("Captured output replay missing builtin ", uint32_t(bi), " array index ", first + a, " component ", c, "."));
+					offset = field->second.byte_offset;
+					scalar_type = field->second.scalar_type;
+				}
+				else
+				{
+					auto field = components.find({location, component + c});
+					if (field == components.end())
+						SPIRV_CROSS_THROW(join("Captured output replay missing Location ", location, " Component ", component + c, "."));
+					offset = field->second.byte_offset;
+					scalar_type = field->second.scalar_type;
+				}
+				if (scalar_type != type.basetype)
+					SPIRV_CROSS_THROW(join("Captured output replay physical scalar type mismatch for output ", to_member_name(output, i), "."));
+				SPIRType scalar(type_is_floating_point(type) ? OpTypeFloat : OpTypeInt);
+				scalar.basetype = scalar_type;
+				scalar.width = type.width;
+				string target = join(stage_out_var_name, ".", to_member_name(output, i));
+				if (!type.array.empty())
+					target += join("[", a, "]");
+				if (type.vecsize > 1)
+					target += join("[", c, "]");
+				statement(target, " = *reinterpret_cast<const device ", type_to_glsl(scalar), "*>(spvReplayRecord + ", offset, "ul);");
+			}
+	}
+	statement(stage_out_var_name, ".", to_member_name(output, key_member), " = spvReplayOccurrences[2ul * spvReplayOccurrence + 1ul];");
+	emit_fixup();
+	statement("return ", stage_out_var_name, ";");
+	end_scope();
+	return buffer.str();
+}
+
 void CompilerMSL::set_msl_per_vertex_input_buffer(const MSLCapturedVertexLayout &layout, const MSLPerVertexInputBinding &binding)
 {
 	per_vertex_input_layout = layout;
@@ -1893,10 +2082,8 @@ void CompilerMSL::emit_entry_point_declarations()
 		statement("threadgroup uint2 spvMeshSizes;");
 }
 
-string CompilerMSL::compile()
+void CompilerMSL::configure_msl_backend()
 {
-	msl_compile_completed = false;
-	captured_output_component_masks.clear();
 	replace_illegal_entry_point_names();
 	ir.fixup_reserved_names();
 
@@ -1943,6 +2130,16 @@ string CompilerMSL::compile()
 	backend.support_pointer_to_pointer = true;
 	backend.implicit_c_integer_promotion_rules = true;
 	backend.supports_spec_constant_array_size = false;
+}
+
+string CompilerMSL::compile()
+{
+	if (captured_output_replay)
+		SPIRV_CROSS_THROW("Captured output replay requires a fresh compiler for subsequent compilation.");
+	msl_compile_started = true;
+	msl_compile_completed = false;
+	captured_output_component_masks.clear();
+	configure_msl_backend();
 
 	capture_output_to_buffer = msl_options.capture_output_to_buffer;
 	is_rasterization_disabled = msl_options.disable_rasterization || capture_output_to_buffer;
@@ -14572,6 +14769,8 @@ string CompilerMSL::member_attribute_qualifier(const SPIRType &type, uint32_t in
 			}
 		}
 		string loc_qual = member_location_attribute_qualifier(type, index);
+		if (captured_output_replay && stage_out_var_id && type.self == get_stage_out_struct_type().self && index == captured_output_replay_key_member)
+			loc_qual += ", flat";
 		if (!loc_qual.empty())
 			return join(" [[", loc_qual, "]]");
 	}
