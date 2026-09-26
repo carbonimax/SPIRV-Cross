@@ -335,6 +335,9 @@ public:
 		bool enable_frag_stencil_ref_builtin = true;
 		bool disable_rasterization = false;
 		bool capture_output_to_buffer = false;
+		// Requires MSL 4.0 and a GPU supporting vertex_value (Apple10 or later).
+		// The caller must also ensure triangle input; MSL version alone does not imply support.
+		bool supports_per_vertex_fragment_input = false;
 		bool swizzle_texture_samples = false;
 		bool tess_domain_origin_lower_left = false;
 		bool multiview = false;
@@ -1041,6 +1044,7 @@ protected:
 
 	std::string to_tesc_invocation_id();
 	void emit_local_masked_variable(const SPIRVariable &masked_var, bool strip_array);
+	void add_per_vertex_input_to_interface_block(const std::string &ib_var_ref, SPIRType &ib_type, const SPIRVariable &var, const SPIRType &type, const std::string &path, uint32_t &location, uint32_t component, uint32_t vertex_count);
 	void add_variable_to_interface_block(StorageClass storage, const std::string &ib_var_ref, SPIRType &ib_type,
 	                                     SPIRVariable &var, InterfaceBlockMeta &meta);
 	void add_composite_variable_to_interface_block(StorageClass storage, const std::string &ib_var_ref,
