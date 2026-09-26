@@ -121,12 +121,100 @@ static void write_msl(const std::string &directory, const std::string &name, con
 	check(bool(file), "Cannot write generated MSL.");
 }
 
+static void test_composites(const std::vector<uint32_t> &words, const std::string &directory)
+{
+	MSLCapturedVertexLayout physical;
+	physical.stride = 416;
+	for (uint32_t location = 0; location <= 24; location++)
+		for (uint32_t component = 0; component < 4; component++)
+		{
+			MSLCapturedVertexComponent field;
+			field.location = location;
+			field.component = component;
+			field.byte_offset = 16 * location + 4 * (3 - component);
+			field.scalar_type = location == 10 ? SPIRType::Int : location == 11 ? SPIRType::UInt : SPIRType::Float;
+			physical.components.push_back(field);
+		}
+	auto buffers = binding();
+	buffers.primitive_index_location = 31;
+	for (bool arguments : {false, true})
+		for (bool arrays : {false, true})
+		{
+			CompilerMSL compiler(words);
+			configure(compiler, arguments, arrays);
+			compiler.set_msl_per_vertex_input_buffer(physical, buffers);
+			auto msl = compiler.compile();
+			check(compiler.needs_per_vertex_input_buffer(), "Composite input has no portable buffers.");
+			check(msl.find("vertex_value") == std::string::npos, "Composite portable input uses native transport.");
+			// Verify actual leaf-to-producer mapping, not just the presence of loads.
+			auto leaf = [&](const std::string &path, uint32_t vertex, uint32_t location, uint32_t component) {
+				auto start = msl.find(path + " = ");
+				check(start != std::string::npos, ("Missing composite assignment: " + path).c_str());
+				auto assignment = msl.substr(start, msl.find(';', start) - start);
+				check(assignment.find("* 3ul + " + std::to_string(vertex) + "ul]") != std::string::npos, "Wrong composite vertex index.");
+				check(assignment.find("* 416ul + " + std::to_string(16 * location + 4 * (3 - component)) + "ul)") != std::string::npos, "Wrong composite Location/Component offset.");
+				check(compiler.is_msl_shader_input_used(location), "Composite leaf location missing from reflection.");
+			};
+			leaf("texcoord[2][1]", 2, 1, 0);
+			leaf("transforms[1][1]", 1, 3, 0);
+			leaf("inputs[2].color", 2, 4, 0);
+			leaf("inputs[2].basis[1]", 2, 6, 0);
+			leaf("inputs[2].nested.weights[1]", 2, 9, 0);
+			leaf("high[2]", 2, 10, 2);
+			leaf("first[0]", 0, 11, 0);
+			leaf("pair[1]", 1, 12, 0);
+			leaf("matrixArray[2][1][1]", 2, 16, 0);
+			leaf("nestedArray[2][1][1]", 2, 20, 0);
+			leaf("located[2].a", 2, 21, 0);
+			leaf("located[2].b", 2, 24, 0);
+			leaf("packedValues[2].value[0]", 2, 22, 2);
+			leaf("packedValues[2].value[1]", 2, 23, 2);
+			check(compiler.is_msl_shader_input_used(25), "Ordinary input missing from reflection.");
+			check(msl.find("[[user(locn25)") != std::string::npos, "Ordinary interpolation lost.");
+			check(msl.find("\n    first[1] =") == std::string::npos && msl.find("\n    pair[2] =") == std::string::npos, "Loaded beyond declared vertex count.");
+			write_msl(directory, std::string("composites") + (arguments ? "-arguments" : "-classic") + (arrays ? "-native-arrays" : ""), msl);
+		}
+	// Every recursively visited leaf must validate mappings and remaps, including later columns.
+	for (bool remap : {false, true})
+	{
+		CompilerMSL compiler(words);
+		configure(compiler);
+		uint32_t location = 16;
+		auto incomplete = physical;
+		if (remap)
+		{
+			MSLShaderInterfaceVariable input;
+			input.location = location;
+			compiler.add_msl_shader_input(input);
+		}
+		else
+			incomplete.components.erase(incomplete.components.begin() + 4 * location);
+		compiler.set_msl_per_vertex_input_buffer(incomplete, buffers);
+		try
+		{
+			compiler.compile();
+		}
+		catch (const CompilerError &error)
+		{
+			check(std::string(error.what()).find(remap ? "remapping" : "missing producer scalar") != std::string::npos, error.what());
+			continue;
+		}
+		throw std::runtime_error("Missing composite validation.");
+	}
+}
+
 int main(int argc, char **argv)
 {
 	try
 	{
 		check(argc >= 2, "Usage: test fixture.spv [output-directory] [existing-reproducer.spv]");
 		auto words = read_spirv(argv[1]);
+		if (argc >= 3 && std::string(argv[2]) == "--composites")
+		{
+			test_composites(words, argc > 3 ? argv[3] : "");
+			std::cout << "Portable composite PerVertexKHR checks passed.\n";
+			return 0;
+		}
 		if (argc == 4 && std::string(argv[2]) == "--reject")
 		{
 			rejects(words, argv[3], [](MSLCapturedVertexLayout &, MSLPerVertexInputBinding &, CompilerMSL &) {});

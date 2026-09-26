@@ -31,7 +31,7 @@ std::string fragment_msl = fragment_compiler.compile(); // Configure fragment MS
 
 The getter reads the **final emitted record**, including member sorting, physical type remapping, member alignment, emitted padding, and tail padding. It reuses the MSL size/alignment helpers; SPIR-V offsets alone are not the capture ABI. Builtins occupy space and affect stride but are **not** returned as Location/Component fields, even if a builtin has an interface location remap. Masked outputs are absent. For Component-packed vectors, only declared lanes are returned; inserted lanes are padding, not additional producer outputs. Query before changing compiler configuration/IR. A failed compilation invalidates the query; no partial layout is returned on any error.
 
-Supported export: final physical numeric scalar/vector user members of 16/32 bits, including flattened interface-block members, plus numeric literal-size one-dimensional builtin arrays for replay. A retained user array, matrix, nested struct, pointer, opaque/64-bit field, unresolved builtin-array size, ambiguous location, duplicate field, omitted/overlapping physical member or overflowing uint32 offset/stride is rejected. A composite already flattened by the backend into supported members is described according to those final members; this does not enable composite PerVertex fragment inputs. The getter is restricted to vertex capture with an output record, including the vertex-as-compute mode. It does not export TCS/TES/mesh or patch records.
+Supported export: final physical numeric scalar/vector user members of 16/32 bits, including flattened interface-block members, plus numeric literal-size one-dimensional builtin arrays for replay. A retained user array, matrix, nested struct, pointer, opaque/64-bit field, unresolved builtin-array size, ambiguous location, duplicate field, omitted/overlapping physical member or overflowing uint32 offset/stride is rejected. A composite already flattened by the backend into supported members is described according to those final members; the portable consumer can reconstruct composite PerVertex fragment inputs from matching scalar descriptors. The getter is restricted to vertex capture with an output record, including the vertex-as-compute mode. It does not export TCS/TES/mesh or patch records.
 
 The simple regression exports stride **32** and color offsets **0/4/8** for `float3 color` plus Position. The mixed regression exports stride **112**, with component-packed `float4`, `half3`, `ushort`, a flattened block (`float`, `float3`), another `float3`, Position, PointSize, a two-float ClipDistance array, Layer and ViewportIndex. C++ tests check the expected ABI and append `sizeof`, `__builtin_offsetof`, and type assertions to the **actual generated MSL**, compiled with Metal. Builtin arrays with stage-output attributes in vertex capture records use native arrays, since Metal rejects `clip_distance` on the generic array wrapper. Default/native arrays, vertex/vertex-as-compute capture, builtin location remapping, and forwarding ClipDistance to a helper function are tested.
 
@@ -90,9 +90,9 @@ The runtime owns primitive assembly and ordering, base vertex/index handling, re
 
 ## Supported subset and validation
 
-Supported: variable-decorated PerVertexKHR arrays of 1-3 elements, each a scalar or vector of `Half`, `Short`, `UShort`, `Float`, `Int` or `UInt`; scalar-exact producer types; Location/Component; dynamic indexing; forwarding local arrays to functions; ordinary inputs; classic bindings and argument buffers; SPIRV-Cross arrays and native MSL arrays. Existing arrays are reconstructed before the shader body; the ordinary access-chain path is preserved.
+Supported: variable-decorated PerVertexKHR arrays of 1-3 vertices. Each vertex may contain matrices, literal-size arrays (including multidimensional arrays), structs and blocks, recursively composed of scalars/vectors of `Half`, `Short`, `UShort`, `Float`, `Int` or `UInt`; scalar-exact producer types; Location/Component; dynamic indexing; forwarding local arrays to functions; ordinary inputs; classic bindings and argument buffers; SPIRV-Cross arrays and native MSL arrays. Existing arrays are reconstructed before the shader body; the ordinary access-chain path is preserved.
 
-Rejected: inner arrays, matrices, structs/blocks, member-decorated PerVertexKHR, nonliteral outer sizes, 64-bit or other scalar types, missing locations/mappings, mismatched scalar types, captured input remapping through `add_msl_shader_input`, duplicate logical fields, overlapping physical scalars, misaligned or out-of-stride scalars, invalid or colliding resource indices, private location collisions, and fragment output capture. Extra producer scalar fields are allowed but must satisfy the same layout rules. Buffer indices must be distinct and in [0, 30]; collision checks include buffer arrays, actual argument buffer bindings and implicit fragment buffers. The runtime must also reserve Metal's vertex descriptor buffer slots where applicable.
+Rejected: member-decorated PerVertexKHR (see the specification boundary below), builtin members, nested PerVertexKHR decorations, nonliteral or zero array sizes, 64-bit or other scalar types, missing locations/mappings, mismatched scalar types, captured input remapping through `add_msl_shader_input`, duplicate logical fields, overlapping physical scalars, misaligned or out-of-stride scalars, invalid or colliding resource indices, private location collisions, and fragment output capture. Extra producer scalar fields are allowed but must satisfy the same layout rules. Buffer indices must be distinct and in [0, 30]; collision checks include buffer arrays, actual argument buffer bindings and implicit fragment buffers. The runtime must also reserve Metal's vertex descriptor buffer slots where applicable.
 
 No GPU execution, image comparison, pipeline linking on hardware, topology validation or performance measurement is part of this test. In particular, compiling MSL 2.4 is not proof of runtime portability, synchronization or ordering across all devices.
 
@@ -116,7 +116,7 @@ for shader in OUT/*.metal; do
 done
 ```
 
-An optional third argument loads the standalone single-color PerVertex reproducer and uses its explicit 32-byte producer layout. Unsupported fixtures can be checked with `TEST fixture.spv --reject 'expected diagnostic substring'`. Use the existing native composites and 64-bit fixtures to exercise unsupported types. Optimizing the typed fixture with `spirv-opt -O` and rerunning the test exercises the same ABI after optimizer transformations.
+An optional third argument loads the standalone single-color PerVertex reproducer and uses its explicit 32-byte producer layout. Unsupported fixtures can be checked with `TEST fixture.spv --reject 'expected diagnostic substring'`. Use the existing 64-bit fixture to exercise unsupported scalar types. Optimizing the typed fixture with `spirv-opt -O` and rerunning the test exercises the same ABI after optimizer transformations.
 
 Producer export regressions are registered as `spirv-cross-msl-capture-layout-test`. Regenerate each `msl_capture_layout_*.spv` from the corresponding `.vert`/`.frag` source with the same `glslangValidator -V --target-env vulkan1.1` invocation. Run both tests with:
 
@@ -126,3 +126,31 @@ BUILD/spirv-cross-msl-capture-layout-test tests-other/msl_capture_layout_simple.
 ```
 
 The output-directory argument writes producer MSL with compile-time layout assertions and consumer MSL configured directly with the exported producer layout. Compile those outputs with the MSL 2.4 command above. No GPU execution is involved.
+
+## Composite inputs and specification boundary
+
+The portable path reconstructs the original local composite, so dynamic access chains and helper-function arguments retain their original shape. Only the outer vertex dimension is removed for Location assignment. Inner arrays consume successive element locations, matrices consume successive column locations, and structs are traversed in declaration order. A block may use a Location on the variable or individual Location/Component decorations on its top-level members. The physical layout remains an explicit producer contract; this change does not broaden the producer exporter's accepted output shapes.
+
+Normative sources checked on 2026-09-26:
+
+- [SPV_KHR_fragment_shader_barycentric, Decoration 5285](https://github.com/KhronosGroup/SPIRV-Registry/blob/main/extensions/KHR/SPV_KHR_fragment_shader_barycentric.asciidoc): PerVertexKHR may decorate a memory object or a structure member, Input only.
+- [Vulkan SPIR-V environment](https://github.com/KhronosGroup/Vulkan-Docs/blob/main/appendices/spirvenv.adoc): VUID 06777 requires fragment Input; 06778 requires an array. These rules do not impose scalar/vector-only elements.
+- [Vulkan interfaces](https://github.com/KhronosGroup/Vulkan-Docs/blob/main/chapters/interfaces.adoc), User-Defined Variable Interface, Interface Matching, and Location and Component Assignment: recursively numeric composites are allowed; the extra vertex array level is disregarded for matching and location assignment; inner arrays, matrices and structs use the recursive location rules. Numeric 16-bit interfaces require storageInputOutput16; 64-bit numeric interfaces are legal under their applicable features but remain outside this portable implementation's 16/32-bit ABI.
+- [GL_EXT_fragment_shader_barycentric](https://github.com/KhronosGroup/GLSL/blob/main/extensions/ext/GLSL_EXT_fragment_shader_barycentric.txt), sections 4.3.4 and 4.5: an unsized vertex array becomes size three, explicit sizes must be no more than three. The compiler retains its existing 1-3 limit; this GLSL rule is not asserted to be a separate SPIR-V maximum-size VUID.
+
+**Member Location/Component is supported; member PerVertexKHR is still rejected.** Although SPIR-V permits the latter decoration, Vulkan's special array-element matching rule explicitly says “neither the input nor the output is a structure member.” Therefore a member array cannot be assumed to match a producer scalar/vector by stripping its outer dimension. The current scalar layout API does not encode a separate interpretation for that case. No speculative member ABI is implemented, and this does not claim that every possible use of the SPIR-V member decoration is forbidden.
+
+The explicit `msl_per_vertex_input_members.spvasm` fixture records this boundary. It passes standalone `spirv-val`, which does not prove a linked producer/consumer interface or authorize stripping member array dimensions. Current glslang also drops `pervertexEXT` on individual GLSL block members, so GLSL alone is not a sufficient fixture for that decoration. The rejection test preserves the existing diagnostic.
+
+Regenerate and run the focused fixtures:
+
+```sh
+glslangValidator -V --target-env vulkan1.1 tests-other/msl_per_vertex_input_composites.frag -o tests-other/msl_per_vertex_input_composites.spv
+spirv-as --target-env vulkan1.1 tests-other/msl_per_vertex_input_members.spvasm -o tests-other/msl_per_vertex_input_members.spv
+spirv-val --target-env vulkan1.1 tests-other/msl_per_vertex_input_composites.spv
+spirv-val --target-env vulkan1.1 tests-other/msl_per_vertex_input_members.spv
+ctest --test-dir BUILD -R 'spirv-cross-msl-(per-vertex|capture)' --output-on-failure
+BUILD/spirv-cross-msl-per-vertex-input-test tests-other/msl_per_vertex_input_composites.spv --composites OUT
+```
+
+The C++ checks use deliberately reversed scalar offsets to verify exact leaf/vertex mapping, matrix columns, nested arrays, nested structs, block member locations and component packing, 1/2/3 vertex arrays, ordinary interpolated input coexistence, location reflection, missing mappings and remapping rejection on later columns. Four generated MSL variants exercise classic/argument buffers and default/native arrays. The same checks run after `spirv-opt -O`. Syntax checks use the MSL 2.4 invocation above; no GPU or cross-stage linkage claim follows from them.

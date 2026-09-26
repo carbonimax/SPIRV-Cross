@@ -754,7 +754,9 @@ public:
 
 	// Opt in to portable fragment PerVertexKHR inputs (MSL >= 2.4).
 	// Mutually exclusive with supports_per_vertex_fragment_input for active PerVertex inputs.
-	// Only variable-decorated arrays of 1-3 scalar/vector values are supported; no composites.
+	// Arrays of 1-3 vertices may contain 16/32-bit numeric scalars/vectors, matrices,
+	// literal arrays and structs. Blocks may use member Location/Component decorations.
+	// PerVertexKHR on individual members is not supported (Vulkan interface matching).
 	// Reads record = indices[3 * privatePrimitiveIndex + vertex], then each scalar at
 	// vertices + record * layout.stride + byte_offset. All arithmetic uses ulong.
 	// Bind vertices with alignment >= 4 and indices with alignment >= 4. The caller owns
@@ -1131,6 +1133,7 @@ protected:
 	void validate_per_vertex_input_buffer();
 	void validate_per_vertex_buffer_binding(uint32_t index, uint32_t count = 1) const;
 	void add_per_vertex_input_from_buffer(const std::string &ib_var_ref, const SPIRVariable &var);
+	void add_per_vertex_input_leaf_from_buffer(const std::string &ib_var_ref, const SPIRType &type, uint32_t var_id, const std::string &path, uint32_t &location, uint32_t component, uint32_t count);
 	MSLCapturedVertexLayout per_vertex_input_layout;
 	MSLPerVertexInputBinding per_vertex_input_binding;
 	std::map<LocationComponentPair, MSLCapturedVertexComponent> per_vertex_input_components;

@@ -549,6 +549,11 @@ if (SPIRV_CROSS_CLI)
 				add_test(NAME spirv-cross-msl-per-vertex-input-test
 						COMMAND $<TARGET_FILE:spirv-cross-msl-per-vertex-input-test> ${CMAKE_CURRENT_SOURCE_DIR}/tests-other/msl_per_vertex_input.spv)
 
+				add_test(NAME spirv-cross-msl-per-vertex-composites-test
+						COMMAND $<TARGET_FILE:spirv-cross-msl-per-vertex-input-test> ${CMAKE_CURRENT_SOURCE_DIR}/tests-other/msl_per_vertex_input_composites.spv --composites)
+				add_test(NAME spirv-cross-msl-per-vertex-members-test
+						COMMAND $<TARGET_FILE:spirv-cross-msl-per-vertex-input-test> ${CMAKE_CURRENT_SOURCE_DIR}/tests-other/msl_per_vertex_input_members.spv --reject "Member-decorated PerVertexKHR")
+
 				add_executable(spirv-cross-msl-constexpr-test tests-other/msl_constexpr_test.cpp)
 				target_link_libraries(spirv-cross-msl-constexpr-test spirv-cross-c)
 				set_target_properties(spirv-cross-msl-constexpr-test PROPERTIES LINK_FLAGS "${spirv-cross-link-flags}")
