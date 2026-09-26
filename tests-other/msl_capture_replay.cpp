@@ -490,7 +490,7 @@ int main(int argc, char **argv)
 		rejects([&]() { tese.compile_captured_output_replay(simple_layout, binding); }, "only vertex entry points");
 		CompilerMSL matrix(unsupported);
 		configure(matrix);
-		rejects([&]() { matrix.compile_captured_output_replay(simple_layout, binding); }, "user arrays, matrices");
+		rejects([&]() { matrix.compile_captured_output_replay(simple_layout, binding); }, "physical scalar type mismatch");
 		std::cout << "Captured output replay checks passed.\n";
 		return 0;
 	}

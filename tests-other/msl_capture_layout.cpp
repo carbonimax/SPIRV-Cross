@@ -213,7 +213,13 @@ int main(int argc, char **argv)
 			if (mask_wide)
 				compiler.mask_stage_output_by_location(0, 0);
 			compiler.compile();
-			rejects(compiler, mask_wide ? "matrices" : "16/32-bit");
+			if (mask_wide)
+			{
+				auto layout = compiler.get_msl_captured_vertex_layout();
+				check(layout.stride == 32 && layout.components.size() == 4, "Masked matrix layout failed.");
+			}
+			else
+				rejects(compiler, "16/32-bit");
 		}
 		std::cout << "Captured producer layout checks passed.\n";
 		return 0;

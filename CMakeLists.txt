@@ -551,6 +551,32 @@ if (SPIRV_CROSS_CLI)
 				set_target_properties(spirv-cross-msl-barycentric-test PROPERTIES LINK_FLAGS "${spirv-cross-link-flags}")
 				add_test(NAME spirv-cross-msl-barycentric-test COMMAND $<TARGET_FILE:spirv-cross-msl-barycentric-test> ${barycentric-fixtures})
 
+				set(capture-composite-fixtures)
+				foreach(stage vert frag)
+					set(binary ${CMAKE_CURRENT_BINARY_DIR}/msl_capture_composites.${stage}.spv)
+					add_custom_command(OUTPUT ${binary}
+							COMMAND ${spirv-cross-glslang} -V --target-env vulkan1.1 ${CMAKE_CURRENT_SOURCE_DIR}/tests-other/msl_capture_composites.${stage} -o ${binary}
+							COMMAND ${spirv-cross-spirv-val} --target-env vulkan1.1 ${binary}
+							DEPENDS tests-other/msl_capture_composites.${stage} VERBATIM)
+					list(APPEND capture-composite-fixtures ${binary})
+				endforeach()
+				set(binary ${CMAKE_CURRENT_BINARY_DIR}/msl_capture_mixed_components.spv)
+				add_custom_command(OUTPUT ${binary}
+						COMMAND ${spirv-cross-spirv-as} --target-env vulkan1.1 ${CMAKE_CURRENT_SOURCE_DIR}/tests-other/msl_capture_mixed_components.spvasm -o ${binary}
+						COMMAND ${spirv-cross-spirv-val} --target-env vulkan1.1 ${binary}
+						DEPENDS tests-other/msl_capture_mixed_components.spvasm VERBATIM)
+				list(APPEND capture-composite-fixtures ${binary})
+				set(binary ${CMAKE_CURRENT_BINARY_DIR}/msl_capture_composites_spec_array.spv)
+				add_custom_command(OUTPUT ${binary}
+						COMMAND ${spirv-cross-glslang} -V --target-env vulkan1.1 ${CMAKE_CURRENT_SOURCE_DIR}/tests-other/msl_capture_composites_spec_array.vert -o ${binary}
+						COMMAND ${spirv-cross-spirv-val} --target-env vulkan1.1 ${binary}
+						DEPENDS tests-other/msl_capture_composites_spec_array.vert VERBATIM)
+				list(APPEND capture-composite-fixtures ${binary})
+				add_executable(spirv-cross-msl-capture-composites-test tests-other/msl_capture_composites.cpp ${capture-composite-fixtures})
+				target_link_libraries(spirv-cross-msl-capture-composites-test spirv-cross-msl)
+				set_target_properties(spirv-cross-msl-capture-composites-test PROPERTIES LINK_FLAGS "${spirv-cross-link-flags}")
+				add_test(NAME spirv-cross-msl-capture-composites-test COMMAND $<TARGET_FILE:spirv-cross-msl-capture-composites-test> ${capture-composite-fixtures})
+
 				add_executable(spirv-cross-msl-interface-locations-test tests-other/msl_interface_locations.cpp)
 				target_link_libraries(spirv-cross-msl-interface-locations-test spirv-cross-msl)
 				set_target_properties(spirv-cross-msl-interface-locations-test PROPERTIES LINK_FLAGS "${spirv-cross-link-flags}")

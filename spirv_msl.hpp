@@ -757,7 +757,9 @@ public:
 	// and user Location/Component scalar fields suitable for set_msl_per_vertex_input_buffer().
 	// Builtin scalar fields are exported separately for replay; unused Component packing lanes are omitted.
 	// Throws for absent capture output or unrepresentable physical members (including
-	// unflattened user composites and non-16/32-bit numeric fields). Does not infer draw indexing.
+	// nonliteral array sizes and non-16/32-bit numeric fields). Recursively exports user
+	// structs, arrays and matrix columns with their explicit Location/Component linkage.
+	// Does not infer draw indexing.
 	MSLCapturedVertexLayout get_msl_captured_vertex_layout() const;
 
 	// Compile a rasterizing vertex replay on a fresh compiler configured with the original SPIR-V.
@@ -1186,6 +1188,8 @@ protected:
 	void add_per_vertex_input_to_interface_block(const std::string &ib_var_ref, SPIRType &ib_type, const SPIRVariable &var, const SPIRType &type, const std::string &path, uint32_t &location, uint32_t component, uint32_t vertex_count);
 	void add_variable_to_interface_block(StorageClass storage, const std::string &ib_var_ref, SPIRType &ib_type,
 	                                     SPIRVariable &var, InterfaceBlockMeta &meta);
+	uint32_t interface_composite_element_count(const SPIRType &type) const;
+	std::string interface_composite_element_access(const SPIRType &type, uint32_t index) const;
 	void add_composite_variable_to_interface_block(StorageClass storage, const std::string &ib_var_ref,
 	                                               SPIRType &ib_type, SPIRVariable &var, InterfaceBlockMeta &meta);
 	void add_plain_variable_to_interface_block(StorageClass storage, const std::string &ib_var_ref,
@@ -1546,6 +1550,7 @@ protected:
 	bool is_supported_argument_buffer_type(const SPIRType &type) const;
 
 	bool variable_storage_requires_stage_io(StorageClass storage) const;
+	bool is_local_vertex_output(const SPIRVariable &variable) const;
 
 	bool needs_manual_helper_invocation_updates() const
 	{

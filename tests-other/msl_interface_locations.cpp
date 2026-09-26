@@ -102,14 +102,8 @@ static void test_interface(const std::vector<uint32_t> &words, bool input, bool 
 	{
 		for (const auto &member : {Member{"nested", 4, 0}, Member{"basis", 10, 0}, Member{"tail", 15, 0}, Member{"upper", 18, 2}, Member{"lower", 18, 0}, Member{"early", 2, 1}, Member{"structured", 23, 0}})
 			check_member(compiler, type, member, msl, true);
-		try
-		{
-			compiler.get_msl_captured_vertex_layout();
-			throw std::runtime_error("Composite ABI export must remain unsupported.");
-		}
-		catch (const CompilerError &)
-		{
-		}
+		auto layout = compiler.get_msl_captured_vertex_layout();
+		check(layout.stride == 192 && layout.components.size() == 29, "Incorrect composite capture ABI.");
 	}
 	else
 	{

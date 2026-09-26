@@ -64,95 +64,137 @@ MSLCapturedVertexLayout CompilerMSL::get_msl_captured_vertex_layout() const
 		SPIRV_CROSS_THROW("Captured vertex layout requires a successful MSL compilation first.");
 	if (get_execution_model() != ExecutionModelVertex || !capture_output_to_buffer || !stage_out_var_id)
 		SPIRV_CROSS_THROW("Captured vertex layout requires vertex capture_output_to_buffer with an output record.");
-	const auto &type = get_variable_data_type(get<SPIRVariable>(stage_out_var_id));
-	MSLCapturedVertexLayout layout;
-	uint64_t offset = 0;
-	uint32_t alignment = 1;
-	std::set<LocationComponentPair> fields;
-	std::set<std::tuple<BuiltIn, uint32_t, uint32_t>> builtin_fields;
-	for (uint32_t i = 0; i < type.member_types.size(); i++)
+	// Reflect the emitted declaration, whose interface structs have no SPIR-V Offsets.
+	struct PhysicalLayout
 	{
-		const auto &physical = get<SPIRType>(get_physical_member_type_id(type, i));
-		bool builtin = has_member_decoration(type.self, i, DecorationBuiltIn);
-		if (physical.pointer || physical.columns != 1 || physical.vecsize > 4 || physical.array.size() > 1 || (!builtin && !physical.array.empty()))
-			SPIRV_CROSS_THROW("Captured vertex layout cannot export pointers, matrices or unflattened user arrays.");
-		if (physical.basetype != SPIRType::Half && physical.basetype != SPIRType::Short && physical.basetype != SPIRType::UShort && physical.basetype != SPIRType::Float && physical.basetype != SPIRType::Int && physical.basetype != SPIRType::UInt)
-			SPIRV_CROSS_THROW("Captured vertex layout requires 16/32-bit numeric physical members; unflattened structs and other scalar types are not supported.");
-		SPIRType element = physical;
-		element.op = physical.vecsize > 1 ? OpTypeVector : type_is_floating_point(physical) ? OpTypeFloat : OpTypeInt;
-		element.parent_type = 0;
-		element.array.clear();
-		element.array_size_literal.clear();
-		uint64_t array_size = get_declared_type_size_msl(0, &element, member_is_packed_physical_type(type, i), false);
-		for (uint32_t dim = 0; dim < physical.array.size(); dim++)
-		{
-			if (!physical.array_size_literal[dim] || !physical.array[dim])
-				SPIRV_CROSS_THROW("Captured vertex layout requires literal nonzero builtin array sizes.");
-			array_size *= physical.array[dim];
-			if (array_size > UINT32_MAX)
-				SPIRV_CROSS_THROW("Captured vertex layout builtin array size exceeds the uint32 ABI.");
-		}
-		if (has_extended_member_decoration(type.self, i, SPIRVCrossDecorationOverlappingBinding))
-			SPIRV_CROSS_THROW("Captured vertex layout cannot export overlapping interface members.");
-		uint32_t member_alignment = get_declared_struct_member_alignment_msl(type, i);
-		alignment = max(alignment, member_alignment);
-		// emit_struct_member emits a char padding array before aligning the actual member.
-		offset += get_extended_member_decoration(type.self, i, SPIRVCrossDecorationPaddingTarget);
-		offset = (offset + member_alignment - 1) & ~(uint64_t(member_alignment) - 1);
-		uint32_t size = get_declared_struct_member_size_msl(type, i);
-		if (offset + size > UINT32_MAX)
+		SPIRType type;
+		uint32_t size = 0, alignment = 1, offset = 0;
+		bool row_major = false;
+		std::vector<PhysicalLayout> children;
+		explicit PhysicalLayout(const SPIRType &t) : type(t) {}
+	};
+	auto checked = [](uint64_t value) -> uint32_t {
+		if (value > UINT32_MAX)
 			SPIRV_CROSS_THROW("Captured vertex layout exceeds the uint32 byte-offset ABI.");
-		if (builtin)
+		return uint32_t(value);
+	};
+	auto align = [&](uint64_t value, uint32_t alignment) { return checked((value + alignment - 1) & ~(uint64_t(alignment) - 1)); };
+	std::function<PhysicalLayout(const SPIRType &, bool, bool)> physical_layout;
+	physical_layout = [&](const SPIRType &type, bool packed, bool row_major) -> PhysicalLayout {
+		PhysicalLayout node(type);
+		node.row_major = row_major;
+		if (type.pointer)
+			SPIRV_CROSS_THROW("Captured vertex layout cannot export pointers.");
+		if (!type.array.empty())
 		{
-			auto builtin_type = BuiltIn(get_member_decoration(type.self, i, DecorationBuiltIn));
-			uint32_t count = physical.array.empty() ? 1 : physical.array[0];
-			uint32_t first_element = get_member_decoration(type.self, i, DecorationIndex);
-			if (first_element > UINT32_MAX - (count - 1))
-				SPIRV_CROSS_THROW("Captured vertex layout builtin array index exceeds the uint32 ABI.");
-			uint32_t element_stride = size / count;
-			for (uint32_t a = 0; a < count; a++)
-				for (uint32_t c = 0; c < physical.vecsize; c++)
-				{
-					if (!builtin_fields.emplace(builtin_type, first_element + a, c).second)
-						SPIRV_CROSS_THROW("Captured vertex layout has duplicate builtin array element/component.");
-					MSLCapturedVertexBuiltin field;
-					field.builtin = builtin_type;
-					field.array_index = first_element + a;
-					field.component = c;
-					field.byte_offset = uint32_t(offset) + a * element_stride + c * (physical.width / 8);
-					field.scalar_type = physical.basetype;
-					layout.builtins.push_back(field);
-				}
+			if (!type.array_size_literal.back() || !type.array.back())
+				SPIRV_CROSS_THROW("Captured vertex layout requires literal nonzero array sizes.");
+			SPIRType element = type;
+			element.array.pop_back();
+			element.array_size_literal.pop_back();
+			node.children.push_back(physical_layout(element, packed, row_major));
+			node.alignment = node.children[0].alignment;
+			node.size = checked(uint64_t(node.children[0].size) * type.array.back());
+		}
+		else if (type.basetype == SPIRType::Struct)
+		{
+			if (packed || has_decoration(type.self, DecorationArrayStride))
+				SPIRV_CROSS_THROW("Captured vertex layout cannot export packed or stride-remapped structs.");
+			for (uint32_t i = 0; i < type.member_types.size(); i++)
+			{
+				if (has_extended_member_decoration(type.self, i, SPIRVCrossDecorationOverlappingBinding))
+					SPIRV_CROSS_THROW("Captured vertex layout cannot export overlapping interface members.");
+				auto child = physical_layout(get<SPIRType>(get_physical_member_type_id(type, i)), member_is_packed_physical_type(type, i), has_member_decoration(type.self, i, DecorationRowMajor));
+				child.offset = align(uint64_t(node.size) + get_extended_member_decoration(type.self, i, SPIRVCrossDecorationPaddingTarget), child.alignment);
+				node.size = checked(uint64_t(child.offset) + child.size);
+				node.alignment = max(node.alignment, child.alignment);
+				node.children.push_back(std::move(child));
+			}
+			node.size = max(1u, align(node.size, node.alignment));
 		}
 		else
 		{
-			uint32_t component;
-			uint32_t location = get_member_location(type.self, i, &component);
-			if (component == k_unknown_component)
-				component = 0;
-			if (location == k_unknown_location || component > 3 || physical.vecsize > 4 - component)
-				SPIRV_CROSS_THROW("Captured vertex layout has an unrepresentable Location/Component.");
-			auto mask = captured_output_component_masks.find(location);
-			for (uint32_t c = 0; c < physical.vecsize; c++)
+			if (type.basetype != SPIRType::Half && type.basetype != SPIRType::Short && type.basetype != SPIRType::UShort && type.basetype != SPIRType::Float && type.basetype != SPIRType::Int && type.basetype != SPIRType::UInt)
+				SPIRV_CROSS_THROW("Captured vertex layout requires 16/32-bit numeric physical members.");
+			if (!type.vecsize || type.vecsize > 4 || !type.columns || type.columns > 4)
+				SPIRV_CROSS_THROW("Captured vertex layout has an unsupported physical vector or matrix shape.");
+			uint32_t rows = row_major && type.columns > 1 ? type.columns : type.vecsize;
+			uint32_t columns = row_major && type.columns > 1 ? type.vecsize : type.columns;
+			uint32_t vector_size = (packed || rows != 3 ? rows : 4) * (type.width / 8);
+			node.alignment = packed ? type.width / 8 : vector_size;
+			node.size = vector_size * columns;
+		}
+		return node;
+	};
+	const auto &type = get_variable_data_type(get<SPIRVariable>(stage_out_var_id));
+	auto record = physical_layout(type, false, false);
+	MSLCapturedVertexLayout layout;
+	layout.stride = record.size;
+	std::set<LocationComponentPair> fields;
+	std::set<std::tuple<BuiltIn, uint32_t, uint32_t>> builtin_fields;
+	std::function<void(const PhysicalLayout &, uint32_t, uint32_t &, uint32_t, BuiltIn, uint32_t, bool)> visit;
+	visit = [&](const PhysicalLayout &node, uint32_t offset, uint32_t &location, uint32_t component, BuiltIn builtin, uint32_t index, bool packed_components) {
+		const auto &physical = node.type;
+		if (!physical.array.empty())
+		{
+			for (uint32_t i = 0; i < physical.array.back(); i++)
+				visit(node.children[0], offset + i * node.children[0].size, location, component, builtin, checked(uint64_t(index) + i), packed_components);
+		}
+		else if (physical.basetype == SPIRType::Struct)
+		{
+			for (uint32_t i = 0; i < node.children.size(); i++)
 			{
-				if (mask != captured_output_component_masks.end() && !(mask->second & (1u << (component + c))))
-					continue;
-				if (!fields.insert({location, component + c}).second)
-					SPIRV_CROSS_THROW("Captured vertex layout has duplicate Location/Component.");
-				MSLCapturedVertexComponent field;
-				field.location = location;
-				field.component = component + c;
-				field.byte_offset = uint32_t(offset) + c * (physical.width / 8);
-				field.scalar_type = physical.basetype;
-				layout.components.push_back(field);
+				if (has_member_decoration(physical.self, i, DecorationLocation))
+					location = get_member_decoration(physical.self, i, DecorationLocation);
+				uint32_t member_component = has_member_decoration(physical.self, i, DecorationComponent) ? get_member_decoration(physical.self, i, DecorationComponent) : component;
+				BuiltIn member_builtin = has_member_decoration(physical.self, i, DecorationBuiltIn) ? BuiltIn(get_member_decoration(physical.self, i, DecorationBuiltIn)) : builtin;
+				visit(node.children[i], offset + node.children[i].offset, location, member_component, member_builtin, get_member_decoration(physical.self, i, DecorationIndex), physical.self == type.self && !has_extended_member_decoration(physical.self, i, SPIRVCrossDecorationInterfaceOrigID));
 			}
 		}
-		offset += size;
-	}
-	offset = (offset + alignment - 1) & ~(uint64_t(alignment) - 1);
-	if (offset > UINT32_MAX)
-		SPIRV_CROSS_THROW("Captured vertex layout stride exceeds the uint32 ABI.");
-	layout.stride = uint32_t(offset);
+		else
+		{
+			if (builtin == BuiltInMax && (location == k_unknown_location || component > 3 || physical.vecsize > 4 - component || physical.columns > k_unknown_location - location))
+				SPIRV_CROSS_THROW("Captured vertex layout has an unrepresentable Location/Component.");
+			if (builtin != BuiltInMax && physical.columns != 1)
+				SPIRV_CROSS_THROW("Captured vertex layout has an unsupported builtin matrix.");
+			uint32_t column_stride = node.size / (node.row_major && physical.columns > 1 ? physical.vecsize : physical.columns);
+			for (uint32_t col = 0; col < physical.columns; col++)
+				for (uint32_t c = 0; c < physical.vecsize; c++)
+				{
+					uint32_t byte_offset = offset + (node.row_major && physical.columns > 1 ? c * column_stride + col * (physical.width / 8) : col * column_stride + c * (physical.width / 8));
+					if (builtin != BuiltInMax)
+					{
+						if (!builtin_fields.emplace(builtin, index, c).second)
+							SPIRV_CROSS_THROW("Captured vertex layout has duplicate builtin array element/component.");
+						MSLCapturedVertexBuiltin field;
+						field.builtin = builtin;
+						field.array_index = index;
+						field.component = c;
+						field.byte_offset = byte_offset;
+						field.scalar_type = physical.basetype;
+						layout.builtins.push_back(field);
+					}
+					else
+					{
+						auto mask = captured_output_component_masks.find(location + col);
+						if (packed_components && mask != captured_output_component_masks.end() && !(mask->second & (1u << (component + c))))
+							continue;
+						if (!fields.insert({location + col, component + c}).second)
+							SPIRV_CROSS_THROW("Captured vertex layout has duplicate Location/Component.");
+						MSLCapturedVertexComponent field;
+						field.location = location + col;
+						field.component = component + c;
+						field.byte_offset = byte_offset;
+						field.scalar_type = physical.basetype;
+						layout.components.push_back(field);
+					}
+				}
+			if (builtin == BuiltInMax)
+				location += physical.columns;
+		}
+	};
+	uint32_t location = k_unknown_location;
+	visit(record, 0, location, 0, BuiltInMax, 0, false);
 	return layout;
 }
 
@@ -263,25 +305,6 @@ string CompilerMSL::compile_captured_output_replay(const MSLCapturedVertexLayout
 			SPIRV_CROSS_THROW(join("Captured output replay does not support output builtin ", builtin, "."));
 	});
 	set_enabled_interface_variables(get_active_interface_variables());
-	// Only plain interface blocks are supported. Do not accidentally accept arrays/matrices
-	// just because the raster interface builder can flatten them, unlike the capture layout.
-	ir.for_each_typed_id<SPIRVariable>([&](uint32_t, const SPIRVariable &var) {
-		if (var.storage != StorageClassOutput || !interface_variable_exists_in_entry_point(var.self))
-			return;
-		const auto &type = get_variable_data_type(var);
-		auto check_user_type = [](const SPIRType &member) {
-			if (member.pointer || !member.array.empty() || member.columns != 1 || member.basetype == SPIRType::Struct)
-				SPIRV_CROSS_THROW("Captured output replay does not support user arrays, matrices or nested structs.");
-		};
-		if (type.basetype == SPIRType::Struct && has_decoration(type.self, DecorationBlock) && type.array.empty())
-		{
-			for (uint32_t i = 0; i < type.member_types.size(); i++)
-				if (!has_member_decoration(type.self, i, DecorationBuiltIn))
-					check_user_type(get<SPIRType>(type.member_types[i]));
-		}
-		else if (!is_builtin_variable(var))
-			check_user_type(type);
-	});
 	capture_output_to_buffer = false;
 	is_rasterization_disabled = false;
 	stage_out_var_id = add_interface_block(StorageClassOutput);
@@ -3410,10 +3433,10 @@ bool CompilerMSL::add_component_variable_to_interface_block(StorageClass storage
 			entry_func.fixup_hooks_in.push_back([=, &type, &var]() {
 				if (!type.array.empty())
 				{
-					uint32_t array_size = to_array_size_literal(type);
+					uint32_t array_size = interface_composite_element_count(type);
 					for (uint32_t loc_off = 0; loc_off < array_size; loc_off++)
 					{
-						statement(to_name(var.self), "[", loc_off, "]", " = ", ib_var_ref,
+						statement(to_name(var.self), interface_composite_element_access(type, loc_off), " = ", ib_var_ref,
 						          ".m_location_", location + loc_off,
 						          vector_swizzle(type_components, start_component), ";");
 					}
@@ -3430,12 +3453,12 @@ bool CompilerMSL::add_component_variable_to_interface_block(StorageClass storage
 			entry_func.fixup_hooks_out.push_back([=, &type, &var]() {
 				if (!type.array.empty())
 				{
-					uint32_t array_size = to_array_size_literal(type);
+					uint32_t array_size = interface_composite_element_count(type);
 					for (uint32_t loc_off = 0; loc_off < array_size; loc_off++)
 					{
 						statement(ib_var_ref, ".m_location_", location + loc_off,
 						          vector_swizzle(type_components, start_component), " = ",
-						          to_name(var.self), "[", loc_off, "];");
+						          to_name(var.self), interface_composite_element_access(type, loc_off), ";");
 					}
 				}
 				else
@@ -3652,31 +3675,49 @@ void CompilerMSL::add_plain_variable_to_interface_block(StorageClass storage, co
 	set_extended_member_decoration(ib_type.self, ib_mbr_idx, SPIRVCrossDecorationInterfaceOrigID, var.self);
 }
 
+uint32_t CompilerMSL::interface_composite_element_count(const SPIRType &type) const
+{
+	if (is_tessellation_shader() && (type.array.size() > 1 || (!type.array.empty() && type.columns > 1)))
+		SPIRV_CROSS_THROW("MSL cannot flatten multidimensional arrays or arrays-of-matrices in tessellation interfaces.");
+	uint64_t count = type.columns;
+	for (uint32_t dim = 0; dim < type.array.size(); dim++)
+	{
+		// A one-dimensional array keeps the default value of a specialization constant size, as before flattening.
+		if (!type.array_size_literal[dim] && type.array.size() > 1)
+			SPIRV_CROSS_THROW("MSL interface composite flattening requires literal array sizes.");
+		uint32_t size = to_array_size_literal(type, dim);
+		if (!size || count > UINT32_MAX / size)
+			SPIRV_CROSS_THROW("MSL interface composite has an invalid or overflowing array size.");
+		count *= size;
+	}
+	return uint32_t(count);
+}
+
+string CompilerMSL::interface_composite_element_access(const SPIRType &type, uint32_t index) const
+{
+	string access;
+	uint32_t stride = interface_composite_element_count(type);
+	for (uint32_t dim = uint32_t(type.array.size()); dim; dim--)
+	{
+		stride /= to_array_size_literal(type, dim - 1);
+		access += join("[", index / stride, "]");
+		index %= stride;
+	}
+	if (type.columns > 1)
+		access += join("[", index, "]");
+	return access;
+}
+
 void CompilerMSL::add_composite_variable_to_interface_block(StorageClass storage, const string &ib_var_ref,
                                                             SPIRType &ib_type, SPIRVariable &var,
                                                             InterfaceBlockMeta &meta)
 {
 	auto &entry_func = get<SPIRFunction>(ir.default_entry_point);
 	auto &var_type = meta.strip_array ? get_variable_element_type(var) : get_variable_data_type(var);
-	uint32_t elem_cnt = 0;
+	uint32_t elem_cnt = interface_composite_element_count(var_type);
 
 	if (add_component_variable_to_interface_block(storage, ib_var_ref, var, var_type, meta))
 		return;
-
-	if (is_matrix(var_type))
-	{
-		if (is_array(var_type))
-			SPIRV_CROSS_THROW("MSL cannot emit arrays-of-matrices in input and output variables.");
-
-		elem_cnt = var_type.columns;
-	}
-	else if (is_array(var_type))
-	{
-		if (var_type.array.size() != 1)
-			SPIRV_CROSS_THROW("MSL cannot emit arrays-of-arrays in input and output variables.");
-
-		elem_cnt = to_array_size_literal(var_type);
-	}
 
 	bool is_builtin = is_builtin_variable(var);
 	BuiltIn builtin = BuiltIn(get_decoration(var.self, DecorationBuiltIn));
@@ -3820,7 +3861,7 @@ void CompilerMSL::add_composite_variable_to_interface_block(StorageClass storage
 			switch (storage)
 			{
 			case StorageClassInput:
-				entry_func.fixup_hooks_in.push_back([=, &var]() {
+				entry_func.fixup_hooks_in.push_back([=, &var, &var_type]() {
 					if (pull_model_inputs.count(var.self))
 					{
 						string lerp_call;
@@ -3830,30 +3871,30 @@ void CompilerMSL::add_composite_variable_to_interface_block(StorageClass storage
 							lerp_call = join(".interpolate_at_sample(", to_expression(builtin_sample_id_id), ")");
 						else
 							lerp_call = ".interpolate_at_center()";
-						statement(to_name(var.self), "[", i, "] = ", ib_var_ref, ".", mbr_name, lerp_call, ";");
+						statement(to_name(var.self), interface_composite_element_access(var_type, i), " = ", ib_var_ref, ".", mbr_name, lerp_call, ";");
 					}
 					else
 					{
-						statement(to_name(var.self), "[", i, "] = ", ib_var_ref, ".", mbr_name, ";");
+						statement(to_name(var.self), interface_composite_element_access(var_type, i), " = ", ib_var_ref, ".", mbr_name, ";");
 					}
 				});
 				break;
 
 			case StorageClassOutput:
-				entry_func.fixup_hooks_out.push_back([=, &var]() {
+				entry_func.fixup_hooks_out.push_back([=, &var, &var_type]() {
 					if (padded_output)
 					{
 						auto &padded_type = this->get<SPIRType>(type_id);
 						statement(
 						    ib_var_ref, ".", mbr_name, " = ",
-						    remap_swizzle(padded_type, usable_type->vecsize, join(to_name(var.self), "[", i, "]")),
+						    remap_swizzle(padded_type, usable_type->vecsize, join(to_name(var.self), interface_composite_element_access(var_type, i))),
 						    ";");
 					}
 					else if (flatten_from_ib_var)
 						statement(ib_var_ref, ".", mbr_name, " = ", ib_var_ref, ".", flatten_from_ib_mbr_name, "[", i,
 						          "];");
 					else
-						statement(ib_var_ref, ".", mbr_name, " = ", to_name(var.self), "[", i, "];");
+						statement(ib_var_ref, ".", mbr_name, " = ", to_name(var.self), interface_composite_element_access(var_type, i), ";");
 				});
 				break;
 
@@ -3908,24 +3949,8 @@ void CompilerMSL::add_composite_member_variable_to_interface_block(StorageClass 
 	uint32_t mbr_type_id = var_type.member_types[mbr_idx];
 	auto &mbr_type = get<SPIRType>(mbr_type_id);
 
-	bool mbr_is_indexable = false;
-	uint32_t elem_cnt = 1;
-	if (is_matrix(mbr_type))
-	{
-		if (is_array(mbr_type))
-			SPIRV_CROSS_THROW("MSL cannot emit arrays-of-matrices in input and output variables.");
-
-		mbr_is_indexable = true;
-		elem_cnt = mbr_type.columns;
-	}
-	else if (is_array(mbr_type))
-	{
-		if (mbr_type.array.size() != 1)
-			SPIRV_CROSS_THROW("MSL cannot emit arrays-of-arrays in input and output variables.");
-
-		mbr_is_indexable = true;
-		elem_cnt = to_array_size_literal(mbr_type);
-	}
+	bool mbr_is_indexable = is_matrix(mbr_type) || is_array(mbr_type);
+	uint32_t elem_cnt = interface_composite_element_count(mbr_type);
 
 	auto *usable_type = &mbr_type;
 	if (usable_type->pointer)
@@ -3967,7 +3992,7 @@ void CompilerMSL::add_composite_member_variable_to_interface_block(StorageClass 
 		for (uint32_t i = 0; i < elem_cnt; i++)
 		{
 			string mbr_name = append_member_name(mbr_name_qual, var_type, mbr_idx) + (mbr_is_indexable ? join("_", i) : "");
-			string var_chain = join(var_chain_qual, ".", to_member_name(var_type, mbr_idx), (mbr_is_indexable ? join("[", i, "]") : ""));
+			string var_chain = join(var_chain_qual, ".", to_member_name(var_type, mbr_idx), interface_composite_element_access(mbr_type, i));
 			uint32_t sub_mbr_cnt = uint32_t(mbr_type.member_types.size());
 			for (uint32_t sub_mbr_idx = 0; sub_mbr_idx < sub_mbr_cnt; sub_mbr_idx++)
 			{
@@ -4065,7 +4090,7 @@ void CompilerMSL::add_composite_member_variable_to_interface_block(StorageClass 
 		// Unflatten or flatten from [[stage_in]] or [[stage_out]] as appropriate.
 		if (!meta.strip_array && meta.allow_local_declaration)
 		{
-			string var_chain = join(var_chain_qual, ".", to_member_name(var_type, mbr_idx), (mbr_is_indexable ? join("[", i, "]") : ""));
+			string var_chain = join(var_chain_qual, ".", to_member_name(var_type, mbr_idx), interface_composite_element_access(mbr_type, i));
 			switch (storage)
 			{
 			case StorageClassInput:
@@ -4233,7 +4258,17 @@ void CompilerMSL::add_plain_member_variable_to_interface_block(StorageClass stor
 		case StorageClassOutput:
 			flatten_stage_out = true;
 			entry_func.fixup_hooks_out.push_back([=]() {
-				statement(qual_var_name, " = ", var_chain, ";");
+				const auto &member_type = get<SPIRType>(mbr_type_id);
+				if (msl_options.force_native_arrays && !member_type.array.empty())
+				{
+					for (uint32_t i = 0; i < interface_composite_element_count(member_type); i++)
+					{
+						auto access = interface_composite_element_access(member_type, i);
+						statement(qual_var_name, access, " = ", var_chain, access, ";");
+					}
+				}
+				else
+					statement(qual_var_name, " = ", var_chain, ";");
 			});
 			break;
 
@@ -4684,21 +4719,7 @@ void CompilerMSL::add_variable_to_interface_block(StorageClass storage, const st
 			bool masked_block = false;
 			uint32_t location = UINT32_MAX;
 			uint32_t var_mbr_idx = 0;
-			uint32_t elem_cnt = 1;
-			if (is_matrix(var_type))
-			{
-				if (is_array(var_type))
-					SPIRV_CROSS_THROW("MSL cannot emit arrays-of-matrices in input and output variables.");
-
-				elem_cnt = var_type.columns;
-			}
-			else if (is_array(var_type))
-			{
-				if (var_type.array.size() != 1)
-					SPIRV_CROSS_THROW("MSL cannot emit arrays-of-arrays in input and output variables.");
-
-				elem_cnt = to_array_size_literal(var_type);
-			}
+			uint32_t elem_cnt = interface_composite_element_count(var_type);
 
 			for (uint32_t elem_idx = 0; elem_idx < elem_cnt; elem_idx++)
 			{
@@ -4758,10 +4779,10 @@ void CompilerMSL::add_variable_to_interface_block(StorageClass storage, const st
 						const string var_name = to_name(var.self);
 						string mbr_name_qual = var_name;
 						string var_chain_qual = var_name;
-						if (elem_cnt > 1)
+						if (is_array(var_type))
 						{
 							mbr_name_qual += join("_", elem_idx);
-							var_chain_qual += join("[", elem_idx, "]");
+							var_chain_qual += interface_composite_element_access(var_type, elem_idx);
 						}
 
 						if ((!is_builtin || attribute_load_store) && storage_is_stage_io && is_composite_type)
@@ -5053,7 +5074,7 @@ uint32_t CompilerMSL::add_interface_block(StorageClass storage, bool patch)
 					{
 						uint32_t array_size = 1;
 						if (!type.array.empty())
-							array_size = to_array_size_literal(type);
+							array_size = interface_composite_element_count(type);
 
 						for (uint32_t location_offset = 0; location_offset < array_size; location_offset++)
 						{
@@ -5460,7 +5481,10 @@ uint32_t CompilerMSL::add_interface_block(StorageClass storage, bool patch)
 		auto &location_meta = loc.second;
 
 		uint32_t ib_mbr_idx = uint32_t(ib_type.member_types.size());
-		uint32_t type_id = build_extended_vector_type(location_meta.base_type_id, location_meta.num_components);
+		auto *element_type = &get<SPIRType>(location_meta.base_type_id);
+		while (is_array(*element_type) || is_matrix(*element_type))
+			element_type = &get<SPIRType>(element_type->parent_type);
+		uint32_t type_id = build_extended_vector_type(element_type->self, location_meta.num_components);
 		ib_type.member_types.push_back(type_id);
 
 		set_member_name(ib_type.self, ib_mbr_idx, join("m_location_", location));
@@ -15651,6 +15675,8 @@ string CompilerMSL::get_type_address_space(const SPIRType &type, uint32_t id, bo
 				}
 				else if (variable_decl_is_remapped_storage(*var, StorageClassWorkgroup))
 					addr_space = "threadgroup";
+				else if (is_local_vertex_output(*var))
+					addr_space = "thread";
 			}
 
 			// BlockIO is passed as thread and lowered on return from main.
@@ -18418,6 +18444,12 @@ string CompilerMSL::constant_op_expression(const SPIRConstantOp &cop)
 	}
 }
 
+bool CompilerMSL::is_local_vertex_output(const SPIRVariable &variable) const
+{
+	const auto &original = variable.basevariable ? get<SPIRVariable>(variable.basevariable) : variable;
+	return get_execution_model() == ExecutionModelVertex && original.storage == StorageClassOutput && original.self != stage_out_var_id && !is_builtin_variable(original) && find(vars_needing_early_declaration.begin(), vars_needing_early_declaration.end(), original.self) != vars_needing_early_declaration.end();
+}
+
 bool CompilerMSL::variable_decl_is_remapped_storage(const SPIRVariable &variable, StorageClass storage) const
 {
 	if (variable.storage == storage)
@@ -18451,6 +18483,10 @@ bool CompilerMSL::variable_decl_is_remapped_storage(const SPIRVariable &variable
 		// refers to a function local pointer.
 		// This is fine, as there cannot be concurrent writers to that memory anyways,
 		// so we just ignore that case.
+
+		// Vertex output blocks are local and copied into the capture record on return.
+		if (is_local_vertex_output(variable))
+			return false;
 
 		return (variable.storage == StorageClassOutput || variable.storage == StorageClassInput) &&
 		       !variable_storage_requires_stage_io(variable.storage) &&
