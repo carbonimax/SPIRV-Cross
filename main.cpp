@@ -641,6 +641,7 @@ struct CLIArguments
 	bool sso = false;
 	bool support_nonzero_baseinstance = true;
 	bool msl_capture_output_to_buffer = false;
+	bool msl_supports_per_vertex_fragment_input = false;
 	bool msl_swizzle_texture_samples = false;
 	bool msl_ios = false;
 	bool msl_pad_fragment_output = false;
@@ -999,6 +1000,7 @@ static void print_help_msl()
 	                "\t\tpartially transformed. This fixup gives correct results on Apple Silicon.\n"
 	                "\t[--msl-combined-sampler-suffix <suffix>]:\n\t\tUses a custom suffix for combined samplers.\n"
 	                "\t[--msl-disable-rasterization]:\n\t\tDisables rasterization and returns void from vertex-like entry points.\n"
+	                "\t[--msl-supports-per-vertex-fragment-input]:\n\t\tEnable PerVertexKHR triangle inputs. Requires MSL 4.0 and a GPU supporting vertex_value (Apple10 or later).\n"
 	                "\t[--msl-auto-disable-rasterization]:\n\t\tDisables rasterization if BuiltInPosition is not written.\n"
 	                "\t[--msl-default-point-size <size>]:\n\t\tApplies a default value if BuiltInPointSize is not written.\n");
 	// clang-format on
@@ -1263,6 +1265,7 @@ static string compile_iteration(const CLIArguments &args, std::vector<uint32_t> 
 		if (args.set_msl_version)
 			msl_opts.msl_version = args.msl_version;
 		msl_opts.capture_output_to_buffer = args.msl_capture_output_to_buffer;
+		msl_opts.supports_per_vertex_fragment_input = args.msl_supports_per_vertex_fragment_input;
 		msl_opts.swizzle_texture_samples = args.msl_swizzle_texture_samples;
 		msl_opts.invariant_float_math = args.msl_invariant_float_math;
 		if (args.msl_ios)
@@ -1755,6 +1758,7 @@ static int main_inner(int argc, char *argv[])
 	cbs.add("--flatten-multidimensional-arrays", [&args](CLIParser &) { args.flatten_multidimensional_arrays = true; });
 	cbs.add("--no-420pack-extension", [&args](CLIParser &) { args.use_420pack_extension = false; });
 	cbs.add("--msl-capture-output", [&args](CLIParser &) { args.msl_capture_output_to_buffer = true; });
+	cbs.add("--msl-supports-per-vertex-fragment-input", [&args](CLIParser &) { args.msl_supports_per_vertex_fragment_input = true; });
 	cbs.add("--msl-swizzle-texture-samples", [&args](CLIParser &) { args.msl_swizzle_texture_samples = true; });
 	cbs.add("--msl-ios", [&args](CLIParser &) { args.msl_ios = true; });
 	cbs.add("--msl-pad-fragment-output", [&args](CLIParser &) { args.msl_pad_fragment_output = true; });
