@@ -572,6 +572,14 @@ if (SPIRV_CROSS_CLI)
 						COMMAND ${spirv-cross-spirv-val} --target-env vulkan1.1 ${binary}
 						DEPENDS tests-other/msl_capture_composites_spec_array.vert VERBATIM)
 				list(APPEND capture-composite-fixtures ${binary})
+				foreach(stage vert frag)
+					set(binary ${CMAKE_CURRENT_BINARY_DIR}/msl_capture_composites_typed.${stage}.spv)
+					add_custom_command(OUTPUT ${binary}
+							COMMAND ${spirv-cross-glslang} -V --target-env vulkan1.1 ${CMAKE_CURRENT_SOURCE_DIR}/tests-other/msl_capture_composites_typed.${stage} -o ${binary}
+							COMMAND ${spirv-cross-spirv-val} --target-env vulkan1.1 ${binary}
+							DEPENDS tests-other/msl_capture_composites_typed.${stage} VERBATIM)
+					list(APPEND capture-composite-fixtures ${binary})
+				endforeach()
 				add_executable(spirv-cross-msl-capture-composites-test tests-other/msl_capture_composites.cpp ${capture-composite-fixtures})
 				target_link_libraries(spirv-cross-msl-capture-composites-test spirv-cross-msl)
 				set_target_properties(spirv-cross-msl-capture-composites-test PROPERTIES LINK_FLAGS "${spirv-cross-link-flags}")
