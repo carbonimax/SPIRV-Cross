@@ -168,10 +168,12 @@ string CompilerMSL::compile_captured_output_replay(const MSLCapturedVertexLayout
 		SPIRV_CROSS_THROW("Captured output replay requires MSL 2.4 or later.");
 	if (msl_options.capture_output_to_buffer || msl_options.vertex_for_tessellation || msl_options.disable_rasterization)
 		SPIRV_CROSS_THROW("Captured output replay requires a normal rasterizing vertex configuration.");
-	if (msl_options.multiview || msl_options.view_index_from_device_index || msl_options.emulate_depth_clip_enable || msl_options.emulate_reversed_depth_viewport || msl_options.enable_point_size_default)
-		SPIRV_CROSS_THROW("Captured output replay does not support multiview, depth/viewport emulation or synthesized default PointSize.");
+	if (msl_options.multiview || msl_options.view_index_from_device_index || msl_options.emulate_depth_clip_enable || msl_options.enable_point_size_default)
+		SPIRV_CROSS_THROW("Captured output replay does not support multiview, depth-clip emulation or synthesized default PointSize.");
 	if (binding.vertex_buffer_index > 30 || binding.occurrence_buffer_index > 30 || binding.draw_parameters_buffer_index > 30 || binding.vertex_buffer_index == binding.occurrence_buffer_index || binding.vertex_buffer_index == binding.draw_parameters_buffer_index || binding.occurrence_buffer_index == binding.draw_parameters_buffer_index)
 		SPIRV_CROSS_THROW("Captured output replay requires three distinct Metal buffer indices in [0, 30].");
+	if (msl_options.emulate_reversed_depth_viewport && (msl_options.reversed_depth_viewport_buffer_index > 30 || msl_options.reversed_depth_viewport_buffer_index == binding.vertex_buffer_index || msl_options.reversed_depth_viewport_buffer_index == binding.occurrence_buffer_index || msl_options.reversed_depth_viewport_buffer_index == binding.draw_parameters_buffer_index))
+		SPIRV_CROSS_THROW("Captured output replay requires a reversed-depth viewport mask buffer index in [0, 30] distinct from the three replay buffers.");
 	if (binding.primitive_index_location == k_unknown_location || !layout.stride)
 		SPIRV_CROSS_THROW("Captured output replay requires a private Location and nonzero captured stride.");
 
@@ -276,7 +278,10 @@ string CompilerMSL::compile_captured_output_replay(const MSLCapturedVertexLayout
 	buffer.reset();
 	emit_header();
 	emit_struct(output);
-	statement("vertex ", type_to_glsl(output), " ", to_name(ir.default_entry_point), "(uint spvReplayVertex [[vertex_id]], uint spvReplayInstance [[instance_id]], const device uchar* spvReplayVertices [[buffer(", binding.vertex_buffer_index, ")]], const device uint* spvReplayOccurrences [[buffer(", binding.occurrence_buffer_index, ")]], constant uint* spvReplayDraw [[buffer(", binding.draw_parameters_buffer_index, ")]])");
+	string reversed_depth_argument;
+	if (msl_options.emulate_reversed_depth_viewport)
+		reversed_depth_argument = join(", constant uint& spvEmulatedReversedDepthViewportMask [[buffer(", msl_options.reversed_depth_viewport_buffer_index, ")]]");
+	statement("vertex ", type_to_glsl(output), " ", to_name(ir.default_entry_point), "(uint spvReplayVertex [[vertex_id]], uint spvReplayInstance [[instance_id]], const device uchar* spvReplayVertices [[buffer(", binding.vertex_buffer_index, ")]], const device uint* spvReplayOccurrences [[buffer(", binding.occurrence_buffer_index, ")]], constant uint* spvReplayDraw [[buffer(", binding.draw_parameters_buffer_index, ")]]", reversed_depth_argument, ")");
 	begin_scope();
 	statement(type_to_glsl(output), " ", stage_out_var_name, ";");
 	statement("ulong spvReplayOccurrence = ulong(spvReplayDraw[0]) + (ulong(spvReplayInstance) - ulong(spvReplayDraw[2])) * ulong(spvReplayDraw[3]) + (ulong(spvReplayVertex) - ulong(spvReplayDraw[1]));");
