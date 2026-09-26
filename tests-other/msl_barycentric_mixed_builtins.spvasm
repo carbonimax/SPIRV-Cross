@@ -17,9 +17,15 @@
 OpCapability Shader
 OpCapability SampleRateShading
 OpCapability ClipDistance
+OpCapability CullDistance
+OpCapability Geometry
+OpCapability MultiViewport
+OpCapability MultiView
+OpCapability DemoteToHelperInvocationEXT
 OpCapability FragmentBarycentricKHR
 OpCapability InterpolationFunction
 OpExtension "SPV_KHR_fragment_shader_barycentric"
+OpExtension "SPV_EXT_demote_to_helper_invocation"
 %glsl = OpExtInstImport "GLSL.std.450"
 OpMemoryModel Logical GLSL450
 OpEntryPoint Fragment %main "main" %weights %color
@@ -28,6 +34,14 @@ OpEntryPoint Fragment %inactive "inactive" %weights %color
 OpEntryPoint Fragment %unsupported "unsupported" %weights %color
 OpEntryPoint Fragment %unsupported_helper "unsupported_helper" %weights %color
 OpEntryPoint Fragment %unsupported_mask "unsupported_mask" %weights %color
+OpEntryPoint Fragment %companions "companions" %weights %color
+OpEntryPoint Fragment %companions_only "companions_only" %weights %color
+OpEntryPoint Fragment %demote "demote" %weights %color
+OpEntryPoint Fragment %unsupported_view "unsupported_view" %weights %color
+OpExecutionMode %companions OriginUpperLeft
+OpExecutionMode %companions_only OriginUpperLeft
+OpExecutionMode %demote OriginUpperLeft
+OpExecutionMode %unsupported_view OriginUpperLeft
 OpExecutionMode %main OriginUpperLeft
 OpExecutionMode %loads OriginUpperLeft
 OpExecutionMode %inactive OriginUpperLeft
@@ -44,6 +58,14 @@ OpMemberDecorate %block 5 BuiltIn SamplePosition
 OpMemberDecorate %block 6 BuiltIn PointCoord
 OpMemberDecorate %block 7 BuiltIn SampleMask
 OpMemberDecorate %block 8 BuiltIn ClipDistance
+OpMemberDecorate %block 9 BuiltIn CullDistance
+OpMemberDecorate %block 10 BuiltIn PrimitiveId
+OpMemberDecorate %block 11 BuiltIn Layer
+OpMemberDecorate %block 12 BuiltIn ViewportIndex
+OpMemberDecorate %block 10 Flat
+OpMemberDecorate %block 11 Flat
+OpMemberDecorate %block 12 Flat
+OpMemberDecorate %block 13 BuiltIn ViewIndex
 OpDecorate %color Location 0
 %void = OpTypeVoid
 %bool = OpTypeBool
@@ -61,9 +83,16 @@ OpDecorate %color Location 0
 %six = OpConstant %uint 6
 %seven = OpConstant %uint 7
 %eight = OpConstant %uint 8
+%nine = OpConstant %uint 9
+%ten = OpConstant %uint 10
+%eleven = OpConstant %uint 11
+%twelve = OpConstant %uint 12
+%thirteen = OpConstant %uint 13
 %mask = OpTypeArray %uint %one
-%clip = OpTypeArray %float %one
-%block = OpTypeStruct %vec3 %vec3 %bool %uint %bool %vec2 %vec2 %mask %clip
+%clip = OpTypeArray %float %two
+%block = OpTypeStruct %vec3 %vec3 %bool %uint %bool %vec2 %vec2 %mask %clip %clip %uint %uint %uint %uint
+%inclip = OpTypePointer Input %clip
+%inmask = OpTypePointer Input %mask
 %inblock = OpTypePointer Input %block
 %in3 = OpTypePointer Input %vec3
 %in2 = OpTypePointer Input %vec2
@@ -75,7 +104,7 @@ OpDecorate %color Location 0
 %vec_fn = OpTypeFunction %vec3
 %weights = OpVariable %inblock Input
 %color = OpVariable %out3 Output
-; Read all supported ordinary members in a helper, exercising argument extraction.
+; Read ordinary scalar/vector members in a helper, exercising argument extraction.
 %ordinary = OpFunction %vec3 None %vec_fn
 %o = OpLabel
 %ffp = OpAccessChain %inbool %weights %two
@@ -135,7 +164,7 @@ OpFunctionEnd
 OpStore %color %ufinal
 OpReturn
 OpFunctionEnd
-; HelperInvocation and SampleMask need additional builtin-block helper handling.
+; Regression entries retain their original names after adding companion lowering.
 %helper_read = OpFunction %vec3 None %vec_fn
 %hr = OpLabel
 %hp = OpAccessChain %inbool %weights %four
@@ -161,5 +190,74 @@ OpFunctionEnd
 %mbasis = OpFunctionCall %vec3 %bary
 %mresult = OpFAdd %vec3 %mbasis %ms
 OpStore %color %mresult
+OpReturn
+OpFunctionEnd
+
+; Array values, copied member pointers, dynamic clip indexing and scalar builtins in a helper.
+%companion_read = OpFunction %vec3 None %vec_fn
+%cr = OpLabel
+%crmaskp = OpAccessChain %inmask %weights %seven
+%crmaskcopy = OpCopyObject %inmask %crmaskp
+%crmask = OpLoad %mask %crmaskcopy
+%crmask0 = OpCompositeExtract %uint %crmask 0
+%cridx = OpUMod %uint %crmask0 %two
+%crclipp = OpAccessChain %inclip %weights %eight
+%crclip = OpLoad %clip %crclipp
+%crclip1 = OpCompositeExtract %float %crclip 1
+%crcp = OpAccessChain %infloat %weights %eight %cridx
+%crc = OpLoad %float %crcp
+%crcullp = OpAccessChain %infloat %weights %nine %one
+%crcull = OpLoad %float %crcullp
+%crpp = OpAccessChain %inuint %weights %ten
+%crp = OpLoad %uint %crpp
+%crlp = OpAccessChain %inuint %weights %eleven
+%crl = OpLoad %uint %crlp
+%crvp = OpAccessChain %inuint %weights %twelve
+%crv = OpLoad %uint %crvp
+%crpl = OpIAdd %uint %crp %crl
+%crplv = OpIAdd %uint %crpl %crv
+%crfloat = OpConvertUToF %float %crplv
+%crsum = OpFAdd %float %crc %crcull
+%crsum2 = OpFAdd %float %crsum %crclip1
+%crresult = OpCompositeConstruct %vec3 %crsum2 %crfloat %crfloat
+OpReturnValue %crresult
+OpFunctionEnd
+%companions_only = OpFunction %void None %void_fn
+%co = OpLabel
+%cores = OpFunctionCall %vec3 %companion_read
+OpStore %color %cores
+OpReturn
+OpFunctionEnd
+%companions = OpFunction %void None %void_fn
+%ca = OpLabel
+%cares = OpFunctionCall %vec3 %companion_read
+%cab = OpFunctionCall %vec3 %bary
+%casum = OpFAdd %vec3 %cares %cab
+OpStore %color %casum
+OpReturn
+OpFunctionEnd
+%demote_helper = OpFunction %vec3 None %vec_fn
+%dh = OpLabel
+OpDemoteToHelperInvocationEXT
+%dhr = OpFunctionCall %vec3 %helper_read
+OpReturnValue %dhr
+OpFunctionEnd
+%demote = OpFunction %void None %void_fn
+%de = OpLabel
+%der = OpFunctionCall %vec3 %demote_helper
+OpStore %color %der
+OpReturn
+OpFunctionEnd
+
+; Keep unsupported companion semantics explicit.
+%unsupported_view = OpFunction %void None %void_fn
+%uv = OpLabel
+%uvp = OpAccessChain %inuint %weights %thirteen
+%uvval = OpLoad %uint %uvp
+%uvf = OpConvertUToF %float %uvval
+%uvf3 = OpCompositeConstruct %vec3 %uvf %uvf %uvf
+%uvb = OpFunctionCall %vec3 %bary
+%uvr = OpFAdd %vec3 %uvf3 %uvb
+OpStore %color %uvr
 OpReturn
 OpFunctionEnd
