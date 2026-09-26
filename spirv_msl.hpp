@@ -120,6 +120,16 @@ struct MSLCapturedOutputReplayBinding
 	uint32_t primitive_index_location = ~0u;
 };
 
+// Optional replay output matching MSLFragmentBarycentricInputBinding. Occurrence
+// corners are packed uint32 scalars in [0, 2], indexed by the same occurrence as
+// the unchanged (record, primitive key) pairs. All defaults disable this output.
+struct MSLCapturedOutputReplayBarycentricBinding
+{
+	uint32_t corner_buffer_index = ~0u;
+	uint32_t perspective_location = ~0u;
+	uint32_t no_perspective_location = ~0u;
+};
+
 struct MSLPerVertexInputBinding
 {
 	uint32_t vertex_buffer_index = ~0u;
@@ -759,6 +769,10 @@ public:
 	// MSL >= 2.4, vertex only; unsupported output shapes, builtins and rasterization options throw.
 	// Consumes this compiler even on failure. Does not emit application resources or function bodies.
 	std::string compile_captured_output_replay(const MSLCapturedVertexLayout &layout, const MSLCapturedOutputReplayBinding &binding);
+	// Optional one-hot float3 output at either/both private barycentric locations.
+	// Requires a distinct corner buffer; caller supplies the original triangle corner
+	// order, bounds and values in [0, 2]. Never inferred from vertex/record IDs.
+	std::string compile_captured_output_replay(const MSLCapturedVertexLayout &layout, const MSLCapturedOutputReplayBinding &binding, const MSLCapturedOutputReplayBarycentricBinding &barycentrics);
 
 	// Opt in to portable fragment PerVertexKHR inputs (MSL >= 2.4).
 	// Mutually exclusive with supports_per_vertex_fragment_input for active PerVertex inputs.
@@ -782,7 +796,7 @@ public:
 	// require locations, distinct from each other, application inputs and the PerVertex key.
 	// Preserves center/centroid/sample and explicit interpolation. NoPersp is always linear.
 	// Explicit interpolation through unresolved/copied input pointers throws.
-	// Does not generate the producer basis or change compile_captured_output_replay().
+	// Does not enable producer basis output; configure the replay overload separately.
 	void set_msl_fragment_barycentric_input(const MSLFragmentBarycentricInputBinding &binding);
 
 	// input is a shader interface variable description used to fix up shader input variables.

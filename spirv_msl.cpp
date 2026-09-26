@@ -158,6 +158,11 @@ MSLCapturedVertexLayout CompilerMSL::get_msl_captured_vertex_layout() const
 
 string CompilerMSL::compile_captured_output_replay(const MSLCapturedVertexLayout &layout, const MSLCapturedOutputReplayBinding &binding)
 {
+	return compile_captured_output_replay(layout, binding, MSLCapturedOutputReplayBarycentricBinding{});
+}
+
+string CompilerMSL::compile_captured_output_replay(const MSLCapturedVertexLayout &layout, const MSLCapturedOutputReplayBinding &binding, const MSLCapturedOutputReplayBarycentricBinding &barycentrics)
+{
 	if (msl_compile_started)
 		SPIRV_CROSS_THROW("Captured output replay requires a fresh compiler with the original SPIR-V.");
 	msl_compile_started = true;
@@ -176,6 +181,30 @@ string CompilerMSL::compile_captured_output_replay(const MSLCapturedVertexLayout
 		SPIRV_CROSS_THROW("Captured output replay requires a reversed-depth viewport mask buffer index in [0, 30] distinct from the three replay buffers.");
 	if (binding.primitive_index_location == k_unknown_location || !layout.stride)
 		SPIRV_CROSS_THROW("Captured output replay requires a private Location and nonzero captured stride.");
+	bool emit_barycentrics = barycentrics.perspective_location != k_unknown_location || barycentrics.no_perspective_location != k_unknown_location;
+	if (!emit_barycentrics && barycentrics.corner_buffer_index != ~0u)
+		SPIRV_CROSS_THROW("Captured output replay barycentrics require at least one private Location.");
+	if (emit_barycentrics)
+	{
+		uint32_t slot = barycentrics.corner_buffer_index;
+		if (slot > 30 || slot == binding.vertex_buffer_index || slot == binding.occurrence_buffer_index || slot == binding.draw_parameters_buffer_index || (msl_options.emulate_reversed_depth_viewport && slot == msl_options.reversed_depth_viewport_buffer_index))
+			SPIRV_CROSS_THROW("Captured output replay barycentrics require a corner buffer index in [0, 30] distinct from all replay buffers.");
+		if (barycentrics.perspective_location == barycentrics.no_perspective_location)
+			SPIRV_CROSS_THROW("Captured output replay barycentrics require distinct private Locations.");
+		for (uint32_t location : { barycentrics.perspective_location, barycentrics.no_perspective_location })
+		{
+			if (location == k_unknown_location)
+				continue;
+			if (location == binding.primitive_index_location)
+				SPIRV_CROSS_THROW("Captured output replay barycentric Location collides with the primitive key.");
+			for (const auto &field : layout.components)
+				if (field.location == location)
+					SPIRV_CROSS_THROW("Captured output replay barycentric Location collides with the captured layout.");
+			for (const auto &output : outputs_by_location)
+				if (output.first.location == location)
+					SPIRV_CROSS_THROW("Captured output replay barycentric Location collides with an MSL shader output mapping.");
+		}
+	}
 
 	std::map<LocationComponentPair, MSLCapturedVertexComponent> components;
 	std::map<std::tuple<BuiltIn, uint32_t, uint32_t>, MSLCapturedVertexBuiltin> builtins;
@@ -260,8 +289,13 @@ string CompilerMSL::compile_captured_output_replay(const MSLCapturedVertexLayout
 		SPIRV_CROSS_THROW("Captured output replay requires a Position output.");
 	auto &output = get<SPIRType>(get_variable_data_type_id(get<SPIRVariable>(stage_out_var_id)));
 	for (uint32_t i = 0; i < output.member_types.size(); i++)
+	{
 		if (!has_member_decoration(output.self, i, DecorationBuiltIn) && get_member_location(output.self, i) == binding.primitive_index_location)
 			SPIRV_CROSS_THROW("Captured output replay private Location collides with the raster output interface.");
+		uint32_t location = get_member_location(output.self, i);
+		if (emit_barycentrics && location != k_unknown_location && (location == barycentrics.perspective_location || location == barycentrics.no_perspective_location))
+			SPIRV_CROSS_THROW("Captured output replay barycentric Location collides with the raster output interface.");
+	}
 
 	uint32_t uint_id = ir.increase_bound_by(1);
 	auto &uint_type = set<SPIRType>(uint_id, OpTypeInt);
@@ -273,15 +307,34 @@ string CompilerMSL::compile_captured_output_replay(const MSLCapturedVertexLayout
 	set_member_name(output.self, key_member, "spvReplayPrimitive");
 	set_member_decoration(output.self, key_member, DecorationLocation, binding.primitive_index_location);
 	set_member_decoration(output.self, key_member, DecorationFlat);
+	if (emit_barycentrics)
+	{
+		uint32_t float3_id = ir.increase_bound_by(1);
+		auto &float3_type = set<SPIRType>(float3_id, OpTypeFloat);
+		float3_type.basetype = SPIRType::Float;
+		float3_type.width = 32;
+		float3_type.vecsize = 3;
+		for (uint32_t location : { barycentrics.perspective_location, barycentrics.no_perspective_location })
+		{
+			if (location == k_unknown_location)
+				continue;
+			uint32_t member = uint32_t(output.member_types.size());
+			output.member_types.push_back(float3_id);
+			set_member_name(output.self, member, location == barycentrics.perspective_location ? "spvReplayBarycentric" : "spvReplayBarycentricNoPersp");
+			set_member_decoration(output.self, member, DecorationLocation, location);
+		}
+	}
 	// Do not emit resources, application functions or interface fixup hooks. Those hooks
 	// contain application stores and flattening operations, not just rasterization fixups.
 	buffer.reset();
 	emit_header();
 	emit_struct(output);
-	string reversed_depth_argument;
+	string replay_arguments;
 	if (msl_options.emulate_reversed_depth_viewport)
-		reversed_depth_argument = join(", constant uint& spvEmulatedReversedDepthViewportMask [[buffer(", msl_options.reversed_depth_viewport_buffer_index, ")]]");
-	statement("vertex ", type_to_glsl(output), " ", to_name(ir.default_entry_point), "(uint spvReplayVertex [[vertex_id]], uint spvReplayInstance [[instance_id]], const device uchar* spvReplayVertices [[buffer(", binding.vertex_buffer_index, ")]], const device uint* spvReplayOccurrences [[buffer(", binding.occurrence_buffer_index, ")]], constant uint* spvReplayDraw [[buffer(", binding.draw_parameters_buffer_index, ")]]", reversed_depth_argument, ")");
+		replay_arguments = join(", constant uint& spvEmulatedReversedDepthViewportMask [[buffer(", msl_options.reversed_depth_viewport_buffer_index, ")]]");
+	if (emit_barycentrics)
+		replay_arguments += join(", const device uint* spvReplayCorners [[buffer(", barycentrics.corner_buffer_index, ")]]");
+	statement("vertex ", type_to_glsl(output), " ", to_name(ir.default_entry_point), "(uint spvReplayVertex [[vertex_id]], uint spvReplayInstance [[instance_id]], const device uchar* spvReplayVertices [[buffer(", binding.vertex_buffer_index, ")]], const device uint* spvReplayOccurrences [[buffer(", binding.occurrence_buffer_index, ")]], constant uint* spvReplayDraw [[buffer(", binding.draw_parameters_buffer_index, ")]]", replay_arguments, ")");
 	begin_scope();
 	statement(type_to_glsl(output), " ", stage_out_var_name, ";");
 	statement("ulong spvReplayOccurrence = ulong(spvReplayDraw[0]) + (ulong(spvReplayInstance) - ulong(spvReplayDraw[2])) * ulong(spvReplayDraw[3]) + (ulong(spvReplayVertex) - ulong(spvReplayDraw[1]));");
@@ -344,6 +397,12 @@ string CompilerMSL::compile_captured_output_replay(const MSLCapturedVertexLayout
 			}
 	}
 	statement(stage_out_var_name, ".", to_member_name(output, key_member), " = spvReplayOccurrences[2ul * spvReplayOccurrence + 1ul];");
+	if (emit_barycentrics)
+	{
+		statement("uint spvReplayCorner = spvReplayCorners[spvReplayOccurrence];");
+		for (uint32_t member = key_member + 1; member < output.member_types.size(); member++)
+			statement(stage_out_var_name, ".", to_member_name(output, member), " = float3(spvReplayCorner == 0u, spvReplayCorner == 1u, spvReplayCorner == 2u);");
+	}
 	emit_fixup();
 	statement("return ", stage_out_var_name, ";");
 	end_scope();

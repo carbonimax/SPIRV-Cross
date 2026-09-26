@@ -16,6 +16,15 @@ struct MSLCapturedOutputReplayBinding
 };
 
 std::string compile_captured_output_replay(const MSLCapturedVertexLayout &layout, const MSLCapturedOutputReplayBinding &binding);
+
+struct MSLCapturedOutputReplayBarycentricBinding
+{
+    uint32_t corner_buffer_index = ~0u;
+    uint32_t perspective_location = ~0u;
+    uint32_t no_perspective_location = ~0u;
+};
+
+std::string compile_captured_output_replay(const MSLCapturedVertexLayout &layout, const MSLCapturedOutputReplayBinding &binding, const MSLCapturedOutputReplayBarycentricBinding &barycentrics);
 ```
 
 Configure the original entry point, specialization constants, output masks/remaps and rasterization options before calling. MSL must be at least 2.4. Capture, vertex-as-compute and disabled rasterization must be off for replay. The layout comes from the successfully compiled capture producer. Preserve a separate unmodified IR/configuration for replay: ordinary `compile()` mutates IR, builds and sorts interface structs, localizes globals and installs application fixup hooks. The method rejects a compiler on which compilation has already started, and consumes its own compiler even on failure. A subsequent ordinary `compile()` is also rejected. The capture-layout getter remains specific to successful ordinary capture compilation, not replay.
@@ -51,6 +60,44 @@ The caller guarantees IDs are at least their origins, address arithmetic does no
 
 `key` is exactly the portable fragment ABI's absolute triplet index: fragment vertex `j` reads `primitive_indices[3 * uint64(key) + j]`. There is no inferred primitive division, index topology, base vertex, instance or view offset. All replay vertices of one primitive must carry the same key. Shared indexed vertices generally require separate occurrences per primitive to satisfy this; the backend does not create that expansion. The occurrence table also makes the record mapping independent of whether capture used a vertex function or a compute kernel.
 
+## Optional triangle barycentric producer
+
+The three-argument overload matches the [portable fragment barycentric opt-in](msl_barycentric_portable.md) from `66ad847b`. The existing two-argument API and `MSLCapturedOutputReplayBinding` are unchanged. Passing a default-constructed third binding also preserves the legacy source and ABI exactly. Opt in by setting one or both locations and a corner buffer:
+
+```cpp
+MSLCapturedOutputReplayBarycentricBinding barycentrics;
+barycentrics.corner_buffer_index = 3;
+barycentrics.perspective_location = 12;
+barycentrics.no_perspective_location = 14;
+std::string msl = replay.compile_captured_output_replay(layout, binding, barycentrics);
+```
+
+Use the same locations in `MSLFragmentBarycentricInputBinding`; leave an unused producer location at `~0u`. This does not turn on fragment barycentrics or PerVertex input automatically. Reserve each supplied location exclusively, distinct from the other basis location, primitive key, all captured user fields (including masked fields and Component-packed fields), raster outputs and `add_msl_shader_output` mappings. The producer cannot inspect the fragment: the caller must link matching locations and include the opt-in, buffer slot and both locations in shader/pipeline cache identity.
+
+The additional resource is `const device uint* spvReplayCorners [[buffer(N)]]`: tightly packed **uint32 scalars, 4 bytes per occurrence**, with base alignment at least 4. Its slot must be in [0, 30] and distinct from all three replay buffers and the reversed-depth mask when enabled. A location without a valid corner slot, a slot without any location, duplicate locations or collisions fail compilation. Buffer contents and draw-dependent bounds remain the caller's responsibility, as with the existing occurrence and record buffers.
+
+The original 8-byte occurrence pairs and 16-byte draw parameters retain their representation and addressing. Corners use that **same absolute occurrence index**, including occurrence base and normalized vertex/instance origins:
+
+```text
+corner = corners[occurrence]           // 0, 1 or 2 in original PerVertexKHR order
+basis  = float3(corner == 0, corner == 1, corner == 2)
+```
+
+Each configured output is `float3 [[user(locnN)]]` and receives this identical unscaled basis. Fragment interpolation selects perspective versus no-perspective and center/centroid/sample evaluation. Replay neither scales by Position.w nor modifies any existing captured scalar load, primitive key or position fixup. It never derives the corner from vertex ID, record index, primitive key or modulo arithmetic. An out-of-range corner yields a zero vector through the comparisons, not an out-of-range vector write; it is invalid input and does not produce meaningful barycentrics.
+
+For example, if primitive key 40 has the original record triplet `(4, 7, 9)` and key 41 has `(9, 6, 12)`, a valid occurrence slice is:
+
+| Absolute occurrence | Record | Primitive key | Corner | Basis |
+| --- | --- | --- | --- | --- |
+| 5 | 7 | 40 | 1 | `(0, 1, 0)` |
+| 6 | 9 | 40 | 2 | `(0, 0, 1)` |
+| 7 | 4 | 40 | 0 | `(1, 0, 0)` |
+| 8 | 9 | 41 | 0 | `(1, 0, 0)` |
+| 9 | 6 | 41 | 1 | `(0, 1, 0)` |
+| 10 | 12 | 41 | 2 | `(0, 0, 1)` |
+
+Record 9 is reused with different keys and corners. Both tables must contain the required prefix through occurrence 5; setting a nonzero draw occurrence base does not make corner indexing relative to that base. In portable PerVertex mode the invariant is `record == primitive_indices[3 * uint64(key) + corner]`. Use distinct replay vertex occurrences whenever a shared source vertex needs different keys or corners; shared replay indices cannot represent that change. The runtime still owns triangle assembly, winding/provoking-vertex conventions, strips/fans/restarts, degenerates, clipping compatibility and instance/view selection. This is a triangle contract, not point/line barycentric support or an automatic topology expansion.
+
 ## Fixups and initial limits
 
 Capture skips `CompilerMSL::emit_fixup()`, including clip-space conversion, Y inversion, default PointSize and depth/viewport emulation. Replay calls this same raster fixup emitter **exactly once** after loading captured outputs: optional `Options::vertex.fixup_clipspace`, optional reversed-depth correction, then optional `Options::vertex.flip_vert_y`. Reversed-depth correction is `Position.z = Position.w - Position.z` when the selected mask bit is set. It uses `uint(ViewportIndex)` from the captured output if present, otherwise bit zero (also when ViewportIndex is masked). The caller must supply a device-valid viewport index below 32 and bind the same mask as an equivalent ordinary VS draw; no index clamping or mask inference is performed. This supports the existing emulation path on older AMD Mac2 without requiring MSL 4.0. It never invokes application output hooks. `emulate_depth_clip_enable`, multiview and `enable_point_size_default` remain explicitly rejected. A captured application PointSize is supported; missing outputs are not silently synthesized.
@@ -81,4 +128,14 @@ for shader in OUT/*.metal; do
 done
 ```
 
-The test writes 98 MSL shaders: the original 49 capture, normal raster, replay and fixup variants, plus 48 reversed-depth capture/ordinary/replay variants and one masked-ViewportIndex replay. These are CPU code-generation and MSL 2.4 syntax checks; they do not establish AMD Mac2 pipeline creation or GPU replay execution. MoltenVK integration remains separate validation work. TES is a rejection fixture, not a supported replay stage.
+The test writes 134 MSL shaders: the original 98 capture, normal raster, replay and reversed-depth variants, plus 36 barycentric replay variants (three producer fixtures, perspective/no-perspective/both outputs, four clip-space/Y combinations, all with reversed-depth emulation). The optional interface and basis are removed from each generated source and the remaining source is compared exactly with legacy replay, checking all scalar loads, addressing, the key, Position including w, side-effect exclusion and fixups. Tests also check private reflection, disabled defaults, explicit occurrence corner reads, and invalid bindings, including raster-only and Component mapping collisions.
+
+Run the focused replay API and all generated Metal syntax checks without GPU work:
+
+```sh
+bash tests-other/msl_capture_replay.sh BUILD OUT
+```
+
+These are CPU code-generation and MSL 2.4 syntax checks; they do not establish AMD Mac2 pipeline creation, interpolation accuracy or GPU replay execution. MoltenVK integration remains separate validation work. TES is a rejection fixture, not a supported replay stage.
+
+Producer integration verification (2026-09-26): **5/5 focused CTests**, **134 replay/capture/ordinary Metal syntax checks**, and **40 fragment Metal syntax checks** passed. All **98 legacy generated sources** are byte-identical to the pre-change snapshot. Evidence is in `build/replay-barycentric-producer/` (`ctest.log`, `metal.log`, `fragment-metal.log`, `before/`, `metal/`, `fragment-metal/`). No GPU tests were run because this host has stuck U-state processes.
