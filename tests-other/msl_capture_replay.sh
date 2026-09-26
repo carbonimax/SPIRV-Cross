@@ -24,7 +24,9 @@ build=$(cd "$1" && pwd)
 source=$(cd "$(dirname "$0")" && pwd)
 output=${2:-"$build/replay-metal"}
 mkdir -p "$output"
-if ! "$build/spirv-cross-msl-capture-replay-test" "$source/msl_capture_layout_simple.spv" "$source/msl_capture_layout_complex.spv" "$source/msl_capture_replay_effects.spv" "$source/msl_capture_replay_unsupported.spv" "$source/msl_capture_layout_unsupported.spv" "$output" > "$output/api.log" 2>&1; then
+glslangValidator -V --target-env vulkan1.1 "$source/msl_capture_replay_dense.vert" -o "$output/msl_capture_replay_dense.spv" > "$output/dense-build.log" 2>&1
+spirv-val --target-env vulkan1.1 "$output/msl_capture_replay_dense.spv" >> "$output/dense-build.log" 2>&1
+if ! "$build/spirv-cross-msl-capture-replay-test" "$source/msl_capture_layout_simple.spv" "$source/msl_capture_layout_complex.spv" "$source/msl_capture_replay_effects.spv" "$source/msl_capture_replay_unsupported.spv" "$source/msl_capture_layout_unsupported.spv" "$output" "$output/msl_capture_replay_dense.spv" > "$output/api.log" 2>&1; then
     cat "$output/api.log" >&2
     exit 1
 fi
