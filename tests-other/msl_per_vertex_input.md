@@ -12,7 +12,36 @@ This is a compiler-side subset, not a capture/replay implementation or a claim o
 
 ## Producer and resource contract
 
-`MSLCapturedVertexLayout::stride` is the actual byte stride of a captured producer record. Each `MSLCapturedVertexComponent` specifies `(location, component, byte_offset, scalar_type)` for one physical scalar. Offsets are relative to the record start. Components may be noncontiguous; vector padding, unused outputs, and holes are not inferred from the fragment shader. A normal Metal `float3` may occupy 16 bytes even though only 12 bytes are read. A packed or reordered producer requires its own correct offsets and stride. This API does not export or infer the producer layout.
+`MSLCapturedVertexLayout::stride` is the actual byte stride of a captured producer record. Each `MSLCapturedVertexComponent` specifies `(location, component, byte_offset, scalar_type)` for one physical scalar. Offsets are relative to the record start. Components may be noncontiguous; vector padding, unused outputs, and holes are not inferred from the fragment shader. A normal Metal `float3` may occupy 16 bytes even though only 12 bytes are read. A packed or reordered producer requires its own correct offsets and stride. For a producer compiled by this backend, `get_msl_captured_vertex_layout()` exports that physical layout after successful compilation (see below). Externally generated producers still require an explicit matching layout.
+
+### Exporting the compiled producer layout
+
+After compiling a vertex shader with `Options::capture_output_to_buffer = true`, call `get_msl_captured_vertex_layout()`. Its value can be passed directly to the fragment's `set_msl_per_vertex_input_buffer()`:
+
+```cpp
+auto vertex_options = vertex_compiler.get_msl_options();
+vertex_options.set_msl_version(2, 4);
+vertex_options.capture_output_to_buffer = true;
+vertex_compiler.set_msl_options(vertex_options);
+std::string vertex_msl = vertex_compiler.compile();
+spirv_cross::MSLCapturedVertexLayout layout = vertex_compiler.get_msl_captured_vertex_layout();
+fragment_compiler.set_msl_per_vertex_input_buffer(layout, binding);
+std::string fragment_msl = fragment_compiler.compile(); // Configure fragment MSL >= 2.4 beforehand.
+```
+
+The getter reads the **final emitted record**, including member sorting, physical type remapping, member alignment, emitted padding, and tail padding. It reuses the MSL size/alignment helpers; SPIR-V offsets alone are not the capture ABI. Builtins occupy space and affect stride but are **not** returned as Location/Component fields, even if a builtin has an interface location remap. Masked outputs are absent. For Component-packed vectors, only declared lanes are returned; inserted lanes are padding, not additional producer outputs. Query before changing compiler configuration/IR. A failed compilation invalidates the query; no partial layout is returned on any error.
+
+Supported export: final physical numeric scalar/vector user members of 16/32 bits, including flattened interface-block members, plus numeric literal-size one-dimensional builtin arrays for replay. A retained user array, matrix, nested struct, pointer, opaque/64-bit field, unresolved builtin-array size, ambiguous location, duplicate field, omitted/overlapping physical member or overflowing uint32 offset/stride is rejected. A composite already flattened by the backend into supported members is described according to those final members; this does not enable composite PerVertex fragment inputs. The getter is restricted to vertex capture with an output record, including the vertex-as-compute mode. It does not export TCS/TES/mesh or patch records.
+
+The simple regression exports stride **32** and color offsets **0/4/8** for `float3 color` plus Position. The mixed regression exports stride **112**, with component-packed `float4`, `half3`, `ushort`, a flattened block (`float`, `float3`), another `float3`, Position, PointSize, a two-float ClipDistance array, Layer and ViewportIndex. C++ tests check the expected ABI and append `sizeof`, `__builtin_offsetof`, and type assertions to the **actual generated MSL**, compiled with Metal. Builtin arrays with stage-output attributes in vertex capture records use native arrays, since Metal rejects `clip_distance` on the generic array wrapper. Default/native arrays, vertex/vertex-as-compute capture, builtin location remapping, and forwarding ClipDistance to a helper function are tested.
+
+`layout.builtins` contains `MSLCapturedVertexBuiltin` scalar descriptors keyed by `(builtin, array_index, component)`, with `byte_offset` and `scalar_type`. Scalar builtins use both indices zero. Position uses `array_index = 0`, components 0..3; ClipDistance uses its array index with component zero. Each offset is absolute within the captured record. Types describe the emitted Metal representation: for example Layer and ViewportIndex are `UInt`, even when the source SPIR-V uses signed int. Builtins remain separate from the application Location/Component namespace, including when a builtin is assigned a linkage location. `set_msl_per_vertex_input_buffer()` ignores this replay metadata and reads only `components`.
+
+Replay can reconstruct a builtin using `load<field.scalar_type>(captured + uint64(record) * layout.stride + field.byte_offset)` for each of its scalar descriptors. The simple fixture verifies Position at offsets **16/20/24/28**. The complex fixture verifies Position at **64/68/72/76**, PointSize at **80**, ClipDistance[0..1] at **84/88**, Layer at **92**, and ViewportIndex at **96**. All are checked against the actual MSL type with compile-time assertions; masked builtins have no descriptor. This provides the data needed to replay captured builtins without executing application SPIR-V. It does not yet generate the replay shader or select which builtins the render pipeline permits/needs.
+
+The runtime must still implement the producer's capture index formula and construct the primitive table against those actual record indices. A correct layout does not establish draw/instance/topology mapping or memory visibility. Include both producer compilation options and the exported layout in the existing pipeline/cache compatibility decisions.
+
+The masking regression covers PointSize and ClipDistance. Masking Layer on the mixed fixture currently emits an undeclared `gl_Layer` assignment in the backend; that configuration is not validated for integration. This getter describes the generated record, and does not certify that every backend option combination produces legal Metal. The proposed replay compiler contract is described separately in [msl_captured_output_replay.md](msl_captured_output_replay.md); replay generation is not implemented.
 
 `MSLPerVertexInputBinding` specifies:
 
@@ -88,3 +117,12 @@ done
 ```
 
 An optional third argument loads the standalone single-color PerVertex reproducer and uses its explicit 32-byte producer layout. Unsupported fixtures can be checked with `TEST fixture.spv --reject 'expected diagnostic substring'`. Use the existing native composites and 64-bit fixtures to exercise unsupported types. Optimizing the typed fixture with `spirv-opt -O` and rerunning the test exercises the same ABI after optimizer transformations.
+
+Producer export regressions are registered as `spirv-cross-msl-capture-layout-test`. Regenerate each `msl_capture_layout_*.spv` from the corresponding `.vert`/`.frag` source with the same `glslangValidator -V --target-env vulkan1.1` invocation. Run both tests with:
+
+```sh
+ctest --test-dir BUILD -R '^spirv-cross-msl-(capture-layout|per-vertex-input)-test$' --output-on-failure
+BUILD/spirv-cross-msl-capture-layout-test tests-other/msl_capture_layout_simple.spv tests-other/msl_capture_layout_complex.spv tests-other/msl_capture_layout_unsupported.spv tests-other/msl_capture_layout_consumer.spv OUT
+```
+
+The output-directory argument writes producer MSL with compile-time layout assertions and consumer MSL configured directly with the exported producer layout. Compile those outputs with the MSL 2.4 command above. No GPU execution is involved.
