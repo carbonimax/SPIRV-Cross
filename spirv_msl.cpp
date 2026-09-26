@@ -28,6 +28,7 @@
 #include <assert.h>
 #include <iterator>
 #include <numeric>
+#include <tuple>
 
 using namespace SPIRV_CROSS_SPV_HEADER_NAMESPACE;
 using namespace SPIRV_CROSS_NAMESPACE;
@@ -55,6 +56,104 @@ CompilerMSL::CompilerMSL(const ParsedIR &ir_)
 CompilerMSL::CompilerMSL(ParsedIR &&ir_)
     : CompilerGLSL(std::move(ir_))
 {
+}
+
+MSLCapturedVertexLayout CompilerMSL::get_msl_captured_vertex_layout() const
+{
+	if (!msl_compile_completed)
+		SPIRV_CROSS_THROW("Captured vertex layout requires a successful MSL compilation first.");
+	if (get_execution_model() != ExecutionModelVertex || !capture_output_to_buffer || !stage_out_var_id)
+		SPIRV_CROSS_THROW("Captured vertex layout requires vertex capture_output_to_buffer with an output record.");
+	const auto &type = get_variable_data_type(get<SPIRVariable>(stage_out_var_id));
+	MSLCapturedVertexLayout layout;
+	uint64_t offset = 0;
+	uint32_t alignment = 1;
+	std::set<LocationComponentPair> fields;
+	std::set<std::tuple<BuiltIn, uint32_t, uint32_t>> builtin_fields;
+	for (uint32_t i = 0; i < type.member_types.size(); i++)
+	{
+		const auto &physical = get<SPIRType>(get_physical_member_type_id(type, i));
+		bool builtin = has_member_decoration(type.self, i, DecorationBuiltIn);
+		if (physical.pointer || physical.columns != 1 || physical.vecsize > 4 || physical.array.size() > 1 || (!builtin && !physical.array.empty()))
+			SPIRV_CROSS_THROW("Captured vertex layout cannot export pointers, matrices or unflattened user arrays.");
+		if (physical.basetype != SPIRType::Half && physical.basetype != SPIRType::Short && physical.basetype != SPIRType::UShort && physical.basetype != SPIRType::Float && physical.basetype != SPIRType::Int && physical.basetype != SPIRType::UInt)
+			SPIRV_CROSS_THROW("Captured vertex layout requires 16/32-bit numeric physical members; unflattened structs and other scalar types are not supported.");
+		SPIRType element = physical;
+		element.op = physical.vecsize > 1 ? OpTypeVector : type_is_floating_point(physical) ? OpTypeFloat : OpTypeInt;
+		element.parent_type = 0;
+		element.array.clear();
+		element.array_size_literal.clear();
+		uint64_t array_size = get_declared_type_size_msl(0, &element, member_is_packed_physical_type(type, i), false);
+		for (uint32_t dim = 0; dim < physical.array.size(); dim++)
+		{
+			if (!physical.array_size_literal[dim] || !physical.array[dim])
+				SPIRV_CROSS_THROW("Captured vertex layout requires literal nonzero builtin array sizes.");
+			array_size *= physical.array[dim];
+			if (array_size > UINT32_MAX)
+				SPIRV_CROSS_THROW("Captured vertex layout builtin array size exceeds the uint32 ABI.");
+		}
+		if (has_extended_member_decoration(type.self, i, SPIRVCrossDecorationOverlappingBinding))
+			SPIRV_CROSS_THROW("Captured vertex layout cannot export overlapping interface members.");
+		uint32_t member_alignment = get_declared_struct_member_alignment_msl(type, i);
+		alignment = max(alignment, member_alignment);
+		// emit_struct_member emits a char padding array before aligning the actual member.
+		offset += get_extended_member_decoration(type.self, i, SPIRVCrossDecorationPaddingTarget);
+		offset = (offset + member_alignment - 1) & ~(uint64_t(member_alignment) - 1);
+		uint32_t size = get_declared_struct_member_size_msl(type, i);
+		if (offset + size > UINT32_MAX)
+			SPIRV_CROSS_THROW("Captured vertex layout exceeds the uint32 byte-offset ABI.");
+		if (builtin)
+		{
+			auto builtin_type = BuiltIn(get_member_decoration(type.self, i, DecorationBuiltIn));
+			uint32_t count = physical.array.empty() ? 1 : physical.array[0];
+			uint32_t first_element = get_member_decoration(type.self, i, DecorationIndex);
+			if (first_element > UINT32_MAX - (count - 1))
+				SPIRV_CROSS_THROW("Captured vertex layout builtin array index exceeds the uint32 ABI.");
+			uint32_t element_stride = size / count;
+			for (uint32_t a = 0; a < count; a++)
+				for (uint32_t c = 0; c < physical.vecsize; c++)
+				{
+					if (!builtin_fields.emplace(builtin_type, first_element + a, c).second)
+						SPIRV_CROSS_THROW("Captured vertex layout has duplicate builtin array element/component.");
+					MSLCapturedVertexBuiltin field;
+					field.builtin = builtin_type;
+					field.array_index = first_element + a;
+					field.component = c;
+					field.byte_offset = uint32_t(offset) + a * element_stride + c * (physical.width / 8);
+					field.scalar_type = physical.basetype;
+					layout.builtins.push_back(field);
+				}
+		}
+		else
+		{
+			uint32_t component;
+			uint32_t location = get_member_location(type.self, i, &component);
+			if (component == k_unknown_component)
+				component = 0;
+			if (location == k_unknown_location || component > 3 || physical.vecsize > 4 - component)
+				SPIRV_CROSS_THROW("Captured vertex layout has an unrepresentable Location/Component.");
+			auto mask = captured_output_component_masks.find(location);
+			for (uint32_t c = 0; c < physical.vecsize; c++)
+			{
+				if (mask != captured_output_component_masks.end() && !(mask->second & (1u << (component + c))))
+					continue;
+				if (!fields.insert({location, component + c}).second)
+					SPIRV_CROSS_THROW("Captured vertex layout has duplicate Location/Component.");
+				MSLCapturedVertexComponent field;
+				field.location = location;
+				field.component = component + c;
+				field.byte_offset = uint32_t(offset) + c * (physical.width / 8);
+				field.scalar_type = physical.basetype;
+				layout.components.push_back(field);
+			}
+		}
+		offset += size;
+	}
+	offset = (offset + alignment - 1) & ~(uint64_t(alignment) - 1);
+	if (offset > UINT32_MAX)
+		SPIRV_CROSS_THROW("Captured vertex layout stride exceeds the uint32 ABI.");
+	layout.stride = uint32_t(offset);
+	return layout;
 }
 
 void CompilerMSL::set_msl_per_vertex_input_buffer(const MSLCapturedVertexLayout &layout, const MSLPerVertexInputBinding &binding)
@@ -1796,6 +1895,8 @@ void CompilerMSL::emit_entry_point_declarations()
 
 string CompilerMSL::compile()
 {
+	msl_compile_completed = false;
+	captured_output_component_masks.clear();
 	replace_illegal_entry_point_names();
 	ir.fixup_reserved_names();
 
@@ -1992,6 +2093,7 @@ string CompilerMSL::compile()
 		pass_count++;
 	} while (is_forcing_recompilation());
 
+	msl_compile_completed = true;
 	return buffer.str();
 }
 
@@ -2878,6 +2980,12 @@ bool CompilerMSL::add_component_variable_to_interface_block(StorageClass storage
 		uint32_t start_component = get_decoration(var.self, DecorationComponent);
 		uint32_t type_components = type.vecsize;
 		uint32_t num_components = location_meta->num_components;
+		if (storage == StorageClassOutput && capture_output_to_buffer && start_component < 4 && type_components <= 4 - start_component)
+		{
+			uint32_t mask = ((1u << type_components) - 1) << start_component;
+			for (uint32_t loc = 0; loc < type_to_location_count(type); loc++)
+				captured_output_component_masks[location + loc] |= mask;
+		}
 
 		if (pad_fragment_output)
 		{
@@ -14231,7 +14339,9 @@ string CompilerMSL::to_struct_member(const SPIRType &type, uint32_t member_type_
 				 (stage_in_var_id && get_stage_in_struct_type().self == type.self &&
 				  variable_storage_requires_stage_io(StorageClassInput))) ||
 				is_mesh_shader();
-		if (is_ib_in_out && is_member_builtin(type, index, &builtin))
+		// Metal validates builtin array attributes even when the record is only used in a capture buffer.
+		bool is_captured_output = capture_output_to_buffer && get_execution_model() == ExecutionModelVertex && !msl_options.vertex_for_tessellation && stage_out_var_id && get_stage_out_struct_type().self == type.self;
+		if ((is_ib_in_out || is_captured_output) && is_member_builtin(type, index, &builtin))
 			is_using_builtin_array = true;
 		array_type = type_to_array_glsl(physical_type, orig_id);
 	}
@@ -16867,7 +16977,8 @@ string CompilerMSL::argument_decl(const SPIRFunction::Parameter &arg)
 			is_using_builtin_array = true;
 		}
 
-		if (storage == StorageClassOutput && variable_storage_requires_stage_io(storage) &&
+		bool is_captured_vertex = capture_output_to_buffer && get_execution_model() == ExecutionModelVertex && !msl_options.vertex_for_tessellation;
+		if (storage == StorageClassOutput && (variable_storage_requires_stage_io(storage) || is_captured_vertex) &&
 		    !is_stage_output_builtin_masked(builtin_type))
 			is_using_builtin_array = true;
 

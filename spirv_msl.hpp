@@ -94,10 +94,22 @@ struct MSLCapturedVertexComponent
 	SPIRType::BaseType scalar_type = SPIRType::Unknown;
 };
 
+// A captured builtin scalar for replay. Array elements (e.g. ClipDistance) and
+// vector components (e.g. Position) have separate indices; scalar builtins use zero for both.
+struct MSLCapturedVertexBuiltin
+{
+	BuiltIn builtin = BuiltInMax;
+	uint32_t array_index = 0;
+	uint32_t component = 0;
+	uint32_t byte_offset = 0;
+	SPIRType::BaseType scalar_type = SPIRType::Unknown;
+};
+
 struct MSLCapturedVertexLayout
 {
 	uint32_t stride = 0;
 	std::vector<MSLCapturedVertexComponent> components;
+	std::vector<MSLCapturedVertexBuiltin> builtins;
 };
 
 struct MSLPerVertexInputBinding
@@ -714,6 +726,14 @@ public:
 	explicit CompilerMSL(const ParsedIR &ir);
 	explicit CompilerMSL(ParsedIR &&ir);
 
+	// Query after successful vertex compilation with capture_output_to_buffer enabled.
+	// Returns the physical stride of the final emitted record (including builtins/padding),
+	// and user Location/Component scalar fields suitable for set_msl_per_vertex_input_buffer().
+	// Builtin scalar fields are exported separately for replay; unused Component packing lanes are omitted.
+	// Throws for absent capture output or unrepresentable physical members (including
+	// unflattened user composites and non-16/32-bit numeric fields). Does not infer draw indexing.
+	MSLCapturedVertexLayout get_msl_captured_vertex_layout() const;
+
 	// Opt in to portable fragment PerVertexKHR inputs (MSL >= 2.4).
 	// Mutually exclusive with supports_per_vertex_fragment_input for active PerVertex inputs.
 	// Only variable-decorated arrays of 1-3 scalar/vector values are supported; no composites.
@@ -1095,6 +1115,8 @@ protected:
 	MSLCapturedVertexLayout per_vertex_input_layout;
 	MSLPerVertexInputBinding per_vertex_input_binding;
 	std::map<LocationComponentPair, MSLCapturedVertexComponent> per_vertex_input_components;
+	bool msl_compile_completed = false;
+	std::map<uint32_t, uint32_t> captured_output_component_masks;
 	bool per_vertex_input_buffer_enabled = false;
 	bool per_vertex_input_buffer_used = false;
 
