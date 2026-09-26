@@ -129,6 +129,14 @@ struct MSLPerVertexInputBinding
 	uint32_t primitive_index_location = ~0u;
 };
 
+// Private float3 varyings carrying the same one-hot basis at triangle corners 0, 1, 2.
+// The producer must emit (1, 0, 0), (0, 1, 0), (0, 0, 1) in PerVertexKHR order.
+struct MSLFragmentBarycentricInputBinding
+{
+	uint32_t perspective_location = ~0u;
+	uint32_t no_perspective_location = ~0u;
+};
+
 // Matches the binding index of a MSL resource for a binding within a descriptor set.
 // Taken together, the stage, desc_set and binding combine to form a reference to a resource
 // descriptor used in a particular shading stage. The count field indicates the number of
@@ -769,6 +777,14 @@ public:
 		return per_vertex_input_buffer_used;
 	}
 
+	// Opt in to fragment barycentrics via private user varyings, independent of Metal
+	// barycentric_coord. MSL >= 2.4; configure before compile(). Only active builtins
+	// require locations, distinct from each other, application inputs and the PerVertex key.
+	// Preserves center/centroid/sample and explicit interpolation. NoPersp is always linear.
+	// Explicit interpolation through unresolved/copied input pointers throws.
+	// Does not generate the producer basis or change compile_captured_output_replay().
+	void set_msl_fragment_barycentric_input(const MSLFragmentBarycentricInputBinding &binding);
+
 	// input is a shader interface variable description used to fix up shader input variables.
 	// If shader inputs are provided, is_msl_shader_input_used() will return true after
 	// calling ::compile() if the location were used by the MSL code.
@@ -1144,6 +1160,14 @@ protected:
 	std::map<uint32_t, uint32_t> captured_output_component_masks;
 	bool per_vertex_input_buffer_enabled = false;
 	bool per_vertex_input_buffer_used = false;
+	MSLFragmentBarycentricInputBinding fragment_barycentric_input_binding;
+	bool fragment_barycentric_input_enabled = false;
+	std::map<BuiltIn, std::string> fragment_barycentric_input_expressions;
+	std::map<BuiltIn, uint32_t> fragment_barycentric_builtin_ids;
+	std::unordered_set<uint32_t> fragment_barycentric_input_blocks;
+	bool is_portable_barycentric(BuiltIn builtin) const;
+	uint32_t portable_barycentric_location(BuiltIn builtin) const;
+	void prepare_fragment_barycentric_input();
 
 	void add_per_vertex_input_to_interface_block(const std::string &ib_var_ref, SPIRType &ib_type, const SPIRVariable &var, const SPIRType &type, const std::string &path, uint32_t &location, uint32_t component, uint32_t vertex_count);
 	void add_variable_to_interface_block(StorageClass storage, const std::string &ib_var_ref, SPIRType &ib_type,

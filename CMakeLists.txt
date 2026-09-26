@@ -531,6 +531,26 @@ if (SPIRV_CROSS_CLI)
 				target_link_libraries(spirv-cross-small-vector-test spirv-cross-core)
 				set_target_properties(spirv-cross-small-vector-test PROPERTIES LINK_FLAGS "${spirv-cross-link-flags}")
 
+				set(barycentric-fixtures)
+				foreach(fixture portable interpolate block copied_pointer explicit_only mixed_block mixed_frontfacing mixed_builtins)
+					set(binary ${CMAKE_CURRENT_BINARY_DIR}/msl_barycentric_${fixture}.spv)
+					add_custom_command(OUTPUT ${binary}
+							COMMAND ${spirv-cross-spirv-as} --target-env vulkan1.1 ${CMAKE_CURRENT_SOURCE_DIR}/tests-other/msl_barycentric_${fixture}.spvasm -o ${binary}
+							COMMAND ${spirv-cross-spirv-val} --target-env vulkan1.1 ${binary}
+							DEPENDS tests-other/msl_barycentric_${fixture}.spvasm VERBATIM)
+					list(APPEND barycentric-fixtures ${binary})
+				endforeach()
+				set(binary ${CMAKE_CURRENT_BINARY_DIR}/msl_barycentric_per_vertex.spv)
+				add_custom_command(OUTPUT ${binary}
+						COMMAND ${spirv-cross-glslang} -V --target-env vulkan1.1 ${CMAKE_CURRENT_SOURCE_DIR}/tests-other/msl_barycentric_per_vertex.frag -o ${binary}
+						COMMAND ${spirv-cross-spirv-val} --target-env vulkan1.1 ${binary}
+						DEPENDS tests-other/msl_barycentric_per_vertex.frag VERBATIM)
+				list(APPEND barycentric-fixtures ${binary})
+				add_executable(spirv-cross-msl-barycentric-test tests-other/msl_barycentric_portable.cpp ${barycentric-fixtures})
+				target_link_libraries(spirv-cross-msl-barycentric-test spirv-cross-msl)
+				set_target_properties(spirv-cross-msl-barycentric-test PROPERTIES LINK_FLAGS "${spirv-cross-link-flags}")
+				add_test(NAME spirv-cross-msl-barycentric-test COMMAND $<TARGET_FILE:spirv-cross-msl-barycentric-test> ${barycentric-fixtures})
+
 				add_executable(spirv-cross-msl-interface-locations-test tests-other/msl_interface_locations.cpp)
 				target_link_libraries(spirv-cross-msl-interface-locations-test spirv-cross-msl)
 				set_target_properties(spirv-cross-msl-interface-locations-test PROPERTIES LINK_FLAGS "${spirv-cross-link-flags}")

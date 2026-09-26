@@ -357,6 +357,121 @@ void CompilerMSL::set_msl_per_vertex_input_buffer(const MSLCapturedVertexLayout 
 	per_vertex_input_buffer_enabled = true;
 }
 
+void CompilerMSL::set_msl_fragment_barycentric_input(const MSLFragmentBarycentricInputBinding &binding)
+{
+	if (msl_compile_started)
+		SPIRV_CROSS_THROW("Portable barycentric inputs must be configured before compilation.");
+	fragment_barycentric_input_binding = binding;
+	fragment_barycentric_input_enabled = true;
+}
+
+bool CompilerMSL::is_portable_barycentric(BuiltIn builtin) const
+{
+	return fragment_barycentric_input_enabled && get_execution_model() == ExecutionModelFragment && (builtin == BuiltInBaryCoordKHR || builtin == BuiltInBaryCoordNoPerspKHR);
+}
+
+uint32_t CompilerMSL::portable_barycentric_location(BuiltIn builtin) const
+{
+	return builtin == BuiltInBaryCoordKHR ? fragment_barycentric_input_binding.perspective_location : fragment_barycentric_input_binding.no_perspective_location;
+}
+
+void CompilerMSL::prepare_fragment_barycentric_input()
+{
+	if (!fragment_barycentric_input_enabled)
+		return;
+	if (get_execution_model() != ExecutionModelFragment)
+		SPIRV_CROSS_THROW("Portable barycentric inputs require a fragment entry point.");
+	if (!msl_options.supports_msl_version(2, 4))
+		SPIRV_CROSS_THROW("Portable barycentric inputs require MSL 2.4 or later.");
+	// The general builtin analysis misses whole-variable InterpolateAt* operands.
+	// Interface activity already tracks those reads, including reads in helpers.
+	for (auto id : get_active_interface_variables())
+		if (has_decoration(id, DecorationBuiltIn))
+		{
+			auto builtin = BuiltIn(get_decoration(id, DecorationBuiltIn));
+			if (is_portable_barycentric(builtin))
+				active_input_builtins.set(builtin);
+		}
+	bool perspective = has_active_builtin(BuiltInBaryCoordKHR, StorageClassInput);
+	bool linear = has_active_builtin(BuiltInBaryCoordNoPerspKHR, StorageClassInput);
+	if ((perspective && fragment_barycentric_input_binding.perspective_location == k_unknown_location) || (linear && fragment_barycentric_input_binding.no_perspective_location == k_unknown_location))
+		SPIRV_CROSS_THROW("Portable barycentric inputs require a private Location for each active builtin.");
+	if (perspective && linear && fragment_barycentric_input_binding.perspective_location == fragment_barycentric_input_binding.no_perspective_location)
+		SPIRV_CROSS_THROW("Portable barycentric inputs require distinct private Locations for the two builtins.");
+	auto validate = [&](BuiltIn builtin, const SPIRType &type, const Bitset &flags) {
+		if (!is_portable_barycentric(builtin) || !has_active_builtin(builtin, StorageClassInput))
+			return;
+		if (type.basetype != SPIRType::Float || type.width != 32 || type.vecsize != 3 || type.columns != 1 || !type.array.empty())
+			SPIRV_CROSS_THROW("Portable barycentric inputs require float3 builtins.");
+		if (flags.get(DecorationFlat) || flags.get(DecorationPatch) || flags.get(DecorationPerVertexKHR) || (flags.get(DecorationCentroid) && flags.get(DecorationSample)))
+			SPIRV_CROSS_THROW("Portable barycentric inputs do not support Flat, Patch, PerVertexKHR or combined Centroid/Sample decorations.");
+		if (builtin == BuiltInBaryCoordKHR && flags.get(DecorationNoPerspective))
+			SPIRV_CROSS_THROW("NoPerspective decorations are not supported for BaryCoord inputs.");
+	};
+	std::map<BuiltIn, std::pair<uint32_t, uint32_t>> builtin_members;
+	ir.for_each_typed_id<SPIRVariable>([&](uint32_t id, const SPIRVariable &var) {
+		if (var.storage != StorageClassInput || !interface_variable_exists_in_entry_point(id))
+			return;
+		const auto &type = get_variable_data_type(var);
+		if (has_decoration(id, DecorationBuiltIn))
+			validate(BuiltIn(get_decoration(id, DecorationBuiltIn)), type, get_decoration_bitset(id));
+		else if (type.basetype == SPIRType::Struct)
+		{
+			bool barycentric_block = false;
+			for (uint32_t i = 0; i < type.member_types.size(); i++)
+				if (has_member_decoration(type.self, i, DecorationBuiltIn) && is_portable_barycentric(BuiltIn(get_member_decoration(type.self, i, DecorationBuiltIn))))
+					barycentric_block = true;
+			if (barycentric_block)
+				fragment_barycentric_input_blocks.insert(id);
+			for (uint32_t i = 0; i < type.member_types.size(); i++)
+				if (has_member_decoration(type.self, i, DecorationBuiltIn))
+				{
+					auto flags = get_member_decoration_bitset(type.self, i);
+					flags.merge_or(get_decoration_bitset(id));
+					auto builtin = BuiltIn(get_member_decoration(type.self, i, DecorationBuiltIn));
+					validate(builtin, get<SPIRType>(type.member_types[i]), flags);
+					if (!barycentric_block || is_portable_barycentric(builtin) || !has_active_builtin(builtin, StorageClassInput))
+						continue;
+					switch (builtin)
+					{
+					case BuiltInFragCoord:
+					case BuiltInFrontFacing:
+					case BuiltInPointCoord:
+					case BuiltInSampleId:
+					case BuiltInSamplePosition:
+						builtin_members[builtin] = { type.self, i };
+						break;
+					default:
+						// Other builtins may require stage-in varyings or additional lowering.
+						SPIRV_CROSS_THROW(join("MSL fragment input blocks with builtin members do not support active builtin ", uint32_t(builtin), "."));
+					}
+				}
+		}
+	});
+	for (const auto &member : builtin_members)
+	{
+		if (fragment_barycentric_builtin_ids.count(member.first))
+			continue;
+		// Keep ordinary builtins out of the block's pull-model interpolants.
+		// Their existing lowering also supplies position and sample fixups.
+		uint32_t type_id = member.second.first;
+		uint32_t member_index = member.second.second;
+		uint32_t member_type = get<SPIRType>(type_id).member_types[member_index];
+		uint32_t ids = ir.increase_bound_by(2);
+		auto &pointer = set<SPIRType>(ids, get<SPIRType>(member_type));
+		pointer.op = OpTypePointer;
+		pointer.pointer = true;
+		pointer.pointer_depth++;
+		pointer.parent_type = member_type;
+		pointer.storage = StorageClassInput;
+		uint32_t var_id = ids + 1;
+		set<SPIRVariable>(var_id, ids, StorageClassInput);
+		ir.meta[var_id].decoration = ir.meta[type_id].members[member_index];
+		fragment_barycentric_builtin_ids[member.first] = var_id;
+		mark_implicit_builtin(StorageClassInput, member.first, var_id);
+	}
+}
+
 void CompilerMSL::validate_per_vertex_input_buffer()
 {
 	if (!msl_options.supports_msl_version(2, 4))
@@ -2193,6 +2308,7 @@ string CompilerMSL::compile()
 
 	build_function_control_flow_graphs_and_analyze();
 	update_active_builtins();
+	prepare_fragment_barycentric_input();
 	analyze_image_and_sampler_usage();
 	analyze_sampled_image_usage();
 	analyze_interlocked_resource_usage();
@@ -2218,6 +2334,8 @@ string CompilerMSL::compile()
 	fixup_image_load_store_access();
 
 	set_enabled_interface_variables(get_active_interface_variables());
+	for (const auto &builtin : fragment_barycentric_builtin_ids)
+		add_active_interface_variable(builtin.second);
 	if (msl_options.force_active_argument_buffer_resources)
 		activate_argument_buffer_resources();
 
@@ -2928,7 +3046,9 @@ void CompilerMSL::extract_global_variables_from_function(uint32_t func_id, std::
 				}
 				ir.meta[next_id] = ir.meta[arg_id];
 			}
-			else if (is_builtin && has_decoration(p_type->self, DecorationBlock))
+			// Portable barycentric interpolants must travel with stage-in for explicit
+			// interpolation in helpers; expanding this block loses the interpolant object.
+			else if (is_builtin && has_decoration(p_type->self, DecorationBlock) && !(arg_id == stage_in_var_id && !fragment_barycentric_input_expressions.empty()))
 			{
 				// Get the pointee type
 				type_id = get_pointee_type_id(type_id);
@@ -3279,6 +3399,8 @@ void CompilerMSL::add_plain_variable_to_interface_block(StorageClass storage, co
 	BuiltIn builtin = BuiltIn(get_decoration(var.self, DecorationBuiltIn));
 	bool is_flat = has_decoration(var.self, DecorationFlat);
 	bool is_noperspective = has_decoration(var.self, DecorationNoPerspective);
+	if (is_portable_barycentric(builtin) && builtin == BuiltInBaryCoordNoPerspKHR)
+		is_noperspective = true;
 	bool is_centroid = has_decoration(var.self, DecorationCentroid);
 	bool is_sample = has_decoration(var.self, DecorationSample);
 
@@ -3340,6 +3462,8 @@ void CompilerMSL::add_plain_variable_to_interface_block(StorageClass storage, co
 		else
 			qual_var_name += ".interpolate_at_center()";
 	}
+	if (storage == StorageClassInput && is_portable_barycentric(builtin))
+		fragment_barycentric_input_expressions[builtin] = qual_var_name;
 
 	if (padded_output || padded_input)
 	{
@@ -3935,10 +4059,14 @@ void CompilerMSL::add_plain_member_variable_to_interface_block(StorageClass stor
 
 	BuiltIn builtin = BuiltInMax;
 	bool is_builtin = is_member_builtin(var_type, mbr_idx, &builtin);
+	if (storage == StorageClassInput && is_builtin && fragment_barycentric_input_blocks.count(var.self) && !is_portable_barycentric(builtin))
+		return;
 	bool is_flat =
 	    has_member_decoration(var_type.self, mbr_idx, DecorationFlat) || has_decoration(var.self, DecorationFlat);
 	bool is_noperspective = has_member_decoration(var_type.self, mbr_idx, DecorationNoPerspective) ||
 	                        has_decoration(var.self, DecorationNoPerspective);
+	if (is_portable_barycentric(builtin) && builtin == BuiltInBaryCoordNoPerspKHR)
+		is_noperspective = true;
 	bool is_centroid = has_member_decoration(var_type.self, mbr_idx, DecorationCentroid) ||
 	                   has_decoration(var.self, DecorationCentroid);
 	bool is_sample =
@@ -3970,6 +4098,9 @@ void CompilerMSL::add_plain_member_variable_to_interface_block(StorageClass stor
 		else
 			qual_var_name += ".interpolate_at_center()";
 	}
+
+	if (storage == StorageClassInput && is_portable_barycentric(builtin))
+		fragment_barycentric_input_expressions[builtin] = qual_var_name;
 
 	// The SPIRV location of interface variable, used to obtain the initial
 	// MSL location (the location variable) and interface matching
@@ -4832,11 +4963,15 @@ uint32_t CompilerMSL::add_interface_block(StorageClass storage, bool patch)
 		// Barycentric inputs must be emitted in stage-in, because they can have interpolation arguments.
 		if (is_active && (bi_type == BuiltInBaryCoordKHR || bi_type == BuiltInBaryCoordNoPerspKHR))
 		{
-			if (has_seen_barycentric)
+			if (has_seen_barycentric && !is_portable_barycentric(bi_type))
 				SPIRV_CROSS_THROW("Cannot declare both BaryCoordNV and BaryCoordNoPerspNV in same shader in MSL.");
 			has_seen_barycentric = true;
 			hidden = false;
 		}
+		if (is_active && is_builtin && is_block && fragment_barycentric_input_enabled)
+			for (uint32_t i = 0; i < type.member_types.size(); i++)
+				if (has_member_decoration(type.self, i, DecorationBuiltIn) && is_portable_barycentric(BuiltIn(get_member_decoration(type.self, i, DecorationBuiltIn))))
+					hidden = false;
 
 		if (is_active && !hidden && type.pointer && filter_patch_decoration &&
 		    (!is_builtin || is_interface_block_builtin))
@@ -5293,6 +5428,22 @@ uint32_t CompilerMSL::add_interface_block(StorageClass storage, bool patch)
 		set_member_name(ib_type.self, member, "spvPerVertexPrimitive");
 		set_member_decoration(ib_type.self, member, DecorationLocation, location);
 		set_member_decoration(ib_type.self, member, DecorationFlat);
+	}
+	if (storage == StorageClassInput && fragment_barycentric_input_enabled)
+	{
+		for (auto builtin : { BuiltInBaryCoordKHR, BuiltInBaryCoordNoPerspKHR })
+		{
+			if (!has_active_builtin(builtin, storage))
+				continue;
+			uint32_t location = portable_barycentric_location(builtin);
+			if (location_inputs_in_use.count(location))
+				SPIRV_CROSS_THROW("Portable barycentric private Location collides with a fragment input.");
+			if (per_vertex_input_buffer_used && location == per_vertex_input_binding.primitive_index_location)
+				SPIRV_CROSS_THROW("Portable barycentric private Location collides with the PerVertexKHR primitive key.");
+			for (const auto &input : inputs_by_location)
+				if (input.first.location == location)
+					SPIRV_CROSS_THROW("Portable barycentric private Location collides with an MSL shader input mapping.");
+		}
 	}
 
 	// Sort the members of the structure by their locations.
@@ -14890,6 +15041,16 @@ string CompilerMSL::member_attribute_qualifier(const SPIRType &type, uint32_t in
 	// Fragment function inputs
 	if (execution.model == ExecutionModelFragment && type.storage == StorageClassInput)
 	{
+		if (is_portable_barycentric(builtin))
+		{
+			string quals = join("user(locn", portable_barycentric_location(builtin), ")");
+			if (mbr_type.basetype != SPIRType::Interpolant)
+			{
+				const char *position = has_member_decoration(type.self, index, DecorationCentroid) ? "centroid" : has_member_decoration(type.self, index, DecorationSample) ? "sample" : "center";
+				quals += join(", ", position, builtin == BuiltInBaryCoordNoPerspKHR ? "_no_perspective" : "_perspective");
+			}
+			return " [[" + quals + "]]";
+		}
 		string quals;
 		if (is_builtin)
 		{
@@ -17356,7 +17517,8 @@ string CompilerMSL::argument_decl(const SPIRFunction::Parameter &arg)
 		}
 	}
 	else if (!type_is_image && !type_is_tlas &&
-	         (!pull_model_inputs.count(var.basevariable) || type.basetype == SPIRType::Struct))
+	         (!pull_model_inputs.count(var.basevariable) || type.basetype == SPIRType::Struct) &&
+	         !(arg.alias_global_variable && has_decoration(var.self, DecorationBuiltIn) && is_portable_barycentric(BuiltIn(get_decoration(var.self, DecorationBuiltIn)))))
 	{
 		// If this is going to be a reference to a variable pointer, the address space
 		// for the reference has to go before the '&', but after the '*'.
@@ -19098,8 +19260,17 @@ string CompilerMSL::builtin_to_glsl(BuiltIn builtin, StorageClass storage)
 
 	case BuiltInBaryCoordKHR:
 	case BuiltInBaryCoordNoPerspKHR:
-		if (storage == StorageClassInput && current_function && (current_function->self == ir.default_entry_point))
-			return stage_in_var_name + "." + CompilerGLSL::builtin_to_glsl(builtin, storage);
+		if (current_function && current_function->self == ir.default_entry_point)
+		{
+			if (is_portable_barycentric(builtin))
+			{
+				auto expr = fragment_barycentric_input_expressions.find(builtin);
+				if (expr != fragment_barycentric_input_expressions.end())
+					return expr->second;
+			}
+			if (storage == StorageClassInput)
+				return stage_in_var_name + "." + CompilerGLSL::builtin_to_glsl(builtin, storage);
+		}
 		break;
 
 	case BuiltInTessLevelOuter:
@@ -20124,6 +20295,8 @@ bool CompilerMSL::OpCodePreprocessor::handle(Op opcode, const uint32_t *args, ui
 				// Fragment varyings used with pull-model interpolation need special handling,
 				// due to the way pull-model interpolation works in Metal.
 				auto *var = self.maybe_get_backing_variable(args[4]);
+				if (!var && self.fragment_barycentric_input_enabled && (self.has_active_builtin(BuiltInBaryCoordKHR, StorageClassInput) || self.has_active_builtin(BuiltInBaryCoordNoPerspKHR, StorageClassInput)))
+					SPIRV_CROSS_THROW("Portable barycentric inputs do not support explicit interpolation through an unresolved input pointer (including OpCopyObject).");
 				if (var)
 				{
 					self.pull_model_inputs.insert(var->self);
