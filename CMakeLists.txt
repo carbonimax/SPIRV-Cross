@@ -531,6 +531,12 @@ if (SPIRV_CROSS_CLI)
 				target_link_libraries(spirv-cross-small-vector-test spirv-cross-core)
 				set_target_properties(spirv-cross-small-vector-test PROPERTIES LINK_FLAGS "${spirv-cross-link-flags}")
 
+				add_executable(spirv-cross-msl-interface-locations-test tests-other/msl_interface_locations.cpp)
+				target_link_libraries(spirv-cross-msl-interface-locations-test spirv-cross-msl)
+				set_target_properties(spirv-cross-msl-interface-locations-test PROPERTIES LINK_FLAGS "${spirv-cross-link-flags}")
+				add_test(NAME spirv-cross-msl-interface-locations-test
+						COMMAND $<TARGET_FILE:spirv-cross-msl-interface-locations-test> ${CMAKE_CURRENT_SOURCE_DIR}/tests-other/msl_interface_locations.vert.spv ${CMAKE_CURRENT_SOURCE_DIR}/tests-other/msl_interface_locations.frag.spv ${CMAKE_CURRENT_SOURCE_DIR}/tests-other/msl_interface_locations.tese.spv)
+
 				add_executable(spirv-cross-msl-capture-replay-test tests-other/msl_capture_replay.cpp)
 				target_link_libraries(spirv-cross-msl-capture-replay-test spirv-cross-msl)
 				set_target_properties(spirv-cross-msl-capture-replay-test PROPERTIES LINK_FLAGS "${spirv-cross-link-flags}")

@@ -3719,6 +3719,8 @@ void CompilerMSL::add_composite_member_variable_to_interface_block(StorageClass 
 		SPIRV_CROSS_THROW("Component decoration is not supported in tessellation shaders.");
 	if (storage == StorageClassInput && has_member_decoration(var_type.self, mbr_idx, DecorationPerVertexKHR))
 		SPIRV_CROSS_THROW("Member-decorated PerVertexKHR inputs are not supported in MSL.");
+	if (is_tessellation_shader() && has_member_decoration(var_type.self, mbr_idx, DecorationComponent))
+		SPIRV_CROSS_THROW("Component decoration is not supported in tessellation shaders.");
 
 	auto &entry_func = get<SPIRFunction>(ir.default_entry_point);
 
