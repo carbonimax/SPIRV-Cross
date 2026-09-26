@@ -205,6 +205,16 @@ string CompilerMSL::compile_captured_output_replay(const MSLCapturedVertexLayout
 
 string CompilerMSL::compile_captured_output_replay(const MSLCapturedVertexLayout &layout, const MSLCapturedOutputReplayBinding &binding, const MSLCapturedOutputReplayBarycentricBinding &barycentrics)
 {
+	return compile_captured_output_replay_impl(layout, binding, barycentrics, nullptr);
+}
+
+string CompilerMSL::compile_captured_output_replay(const MSLCapturedVertexLayout &layout, const MSLCapturedOutputReplayBinding &binding, const MSLCapturedOutputReplayBarycentricBinding &barycentrics, const std::vector<uint32_t> &user_locations)
+{
+	return compile_captured_output_replay_impl(layout, binding, barycentrics, &user_locations);
+}
+
+string CompilerMSL::compile_captured_output_replay_impl(const MSLCapturedVertexLayout &layout, const MSLCapturedOutputReplayBinding &binding, const MSLCapturedOutputReplayBarycentricBinding &barycentrics, const std::vector<uint32_t> *user_locations)
+{
 	if (msl_compile_started)
 		SPIRV_CROSS_THROW("Captured output replay requires a fresh compiler with the original SPIR-V.");
 	msl_compile_started = true;
@@ -292,6 +302,42 @@ string CompilerMSL::compile_captured_output_replay(const MSLCapturedVertexLayout
 			SPIRV_CROSS_THROW("Captured output replay layout has duplicate builtin array element/component.");
 		validate_scalar(field.scalar_type, field.byte_offset);
 	}
+	std::set<uint32_t> selected_locations;
+	if (user_locations)
+	{
+		for (uint32_t location : *user_locations)
+		{
+			bool captured = std::any_of(layout.components.begin(), layout.components.end(), [=](const MSLCapturedVertexComponent &field) { return field.location == location; });
+			if (location == k_unknown_location || !captured || !selected_locations.insert(location).second)
+				SPIRV_CROSS_THROW("Captured output selected replay Location is invalid, duplicate or absent from the capture layout.");
+		}
+		ir.for_each_typed_id<SPIRVariable>([&](uint32_t id, const SPIRVariable &var) {
+			if (var.storage != StorageClassOutput || !interface_variable_exists_in_entry_point(id))
+				return;
+			const auto &type = get_variable_data_type(var);
+			if (type.basetype == SPIRType::Struct && has_decoration(type.self, DecorationBlock))
+			{
+				for (uint32_t i = 0; i < type.member_types.size(); i++)
+				{
+					if (has_member_decoration(type.self, i, DecorationBuiltIn))
+						continue;
+					uint32_t location = get_declared_member_location(var, i, false);
+					if (location == k_unknown_location)
+						SPIRV_CROSS_THROW("Captured output selected replay requires explicit user output Locations.");
+					if (!selected_locations.count(location))
+						mask_stage_output_by_location(location, get_member_decoration(type.self, i, DecorationComponent));
+				}
+			}
+			else if (!is_builtin_variable(var))
+			{
+				if (!has_decoration(id, DecorationLocation))
+					SPIRV_CROSS_THROW("Captured output selected replay requires explicit user output Locations.");
+				uint32_t location = get_decoration(id, DecorationLocation);
+				if (!selected_locations.count(location))
+					mask_stage_output_by_location(location, get_decoration(id, DecorationComponent));
+			}
+		});
+	}
 
 	configure_msl_backend();
 	fixup_anonymous_struct_names();
@@ -311,6 +357,20 @@ string CompilerMSL::compile_captured_output_replay(const MSLCapturedVertexLayout
 	if (!stage_out_var_id || qual_pos_var_name.empty())
 		SPIRV_CROSS_THROW("Captured output replay requires a Position output.");
 	auto &output = get<SPIRType>(get_variable_data_type_id(get<SPIRVariable>(stage_out_var_id)));
+	if (user_locations)
+	{
+		std::set<uint32_t> emitted_locations;
+		for (uint32_t i = 0; i < output.member_types.size(); i++)
+			if (!has_member_decoration(output.self, i, DecorationBuiltIn))
+			{
+				uint32_t location = get_member_location(output.self, i);
+				if (!selected_locations.count(location))
+					SPIRV_CROSS_THROW("Captured output selected replay cannot omit part of an output or a required user varying.");
+				emitted_locations.insert(location);
+			}
+		if (emitted_locations != selected_locations)
+			SPIRV_CROSS_THROW("Captured output selected replay did not emit a requested Location.");
+	}
 	for (uint32_t i = 0; i < output.member_types.size(); i++)
 	{
 		if (!has_member_decoration(output.self, i, DecorationBuiltIn) && get_member_location(output.self, i) == binding.primitive_index_location)

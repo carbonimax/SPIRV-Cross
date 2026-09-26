@@ -16,9 +16,11 @@
  */
 
 #include "spirv_msl.hpp"
+#include <algorithm>
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <map>
 #include <stdexcept>
 using namespace spirv_cross;
 
@@ -220,6 +222,7 @@ int main(int argc, char **argv)
 		auto tessellation = read_spirv(argv[4]);
 		auto unsupported = read_spirv(argv[5]);
 		std::string directory = argc > 6 ? argv[6] : "";
+		std::vector<uint32_t> dense = argc > 7 ? read_spirv(argv[7]) : std::vector<uint32_t>{};
 		MSLCapturedOutputReplayBinding binding;
 		binding.vertex_buffer_index = 0;
 		binding.occurrence_buffer_index = 1;
@@ -272,6 +275,81 @@ int main(int argc, char **argv)
 					write(directory, name + "-normal", normal_msl);
 					write(directory, name + "-replay", replay_msl);
 				}
+		CompilerMSL selected_none(simple), selected_color(simple);
+		configure(selected_none);
+		configure(selected_color);
+		auto position_only = selected_none.compile_captured_output_replay(simple_layout, binding, {}, std::vector<uint32_t>{});
+		auto color_and_position = selected_color.compile_captured_output_replay(simple_layout, binding, {}, std::vector<uint32_t>{0});
+		check(position_only.find("[[user(locn0)]]") == std::string::npos && position_only.find("out.color") == std::string::npos, "Unconsumed user varying was emitted by selected replay.");
+		check(position_only.find("gl_Position [[position]]") != std::string::npos && position_only.find("spvReplayPrimitive [[user(locn15), flat]]") != std::string::npos, "Selected replay lost fixed Position or the private key.");
+		check(position_only.find("spvReplayRecord + 16ul") != std::string::npos && position_only.find("spvReplayRecord + 0ul") == std::string::npos, "Selected replay read a discarded user varying or lost the captured Position offset.");
+		check(color_and_position.find("float3 color [[user(locn0)]]") != std::string::npos && color_and_position.find("out.color[2]") != std::string::npos, "Selected replay dropped a required user varying.");
+		CompilerMSL selected_barycentrics(simple);
+		configure(selected_barycentrics);
+		MSLCapturedOutputReplayBarycentricBinding selected_basis;
+		selected_basis.corner_buffer_index = 3;
+		selected_basis.perspective_location = 12;
+		selected_basis.no_perspective_location = 14;
+		auto basis_only = selected_barycentrics.compile_captured_output_replay(simple_layout, binding, selected_basis, std::vector<uint32_t>{});
+		check(basis_only.find("[[user(locn0)]]") == std::string::npos && basis_only.find("[[position]]") != std::string::npos, "Selected barycentric replay retained an ordinary varying or lost Position.");
+		check(basis_only.find("spvReplayPrimitive [[user(locn15), flat]]") != std::string::npos && basis_only.find("spvReplayBarycentric [[user(locn12)]]") != std::string::npos && basis_only.find("spvReplayBarycentricNoPersp [[user(locn14)]]") != std::string::npos, "Selected replay lost its private key or barycentric bases.");
+		write(directory, "simple-selected-position", position_only);
+		write(directory, "simple-selected-barycentrics", basis_only);
+		write(directory, "simple-selected-color", color_and_position);
+		for (const auto &locations : {std::vector<uint32_t>{1}, std::vector<uint32_t>{0, 0}, std::vector<uint32_t>{~0u}})
+		{
+			CompilerMSL invalid(simple);
+			configure(invalid);
+			rejects([&]() { invalid.compile_captured_output_replay(simple_layout, binding, {}, locations); }, "selected replay Location");
+		}
+		CompilerMSL complex_capture(complex), complex_selected(complex);
+		configure(complex_capture, true);
+		configure(complex_selected);
+		complex_capture.compile();
+		auto complex_layout = complex_capture.get_msl_captured_vertex_layout();
+		std::vector<uint32_t> complex_locations;
+		for (const auto &field : complex_layout.components)
+			if (field.location != 7 && std::find(complex_locations.begin(), complex_locations.end(), field.location) == complex_locations.end())
+				complex_locations.push_back(field.location);
+		auto complex_msl = complex_selected.compile_captured_output_replay(complex_layout, binding, {}, complex_locations);
+		check(complex_msl.find("[[user(locn7)]]") == std::string::npos && complex_msl.find("out.later") == std::string::npos, "Selected replay retained an unused Location.");
+		for (const char *fixed : {"[[position]]", "[[point_size]]", "[[clip_distance]]", "[[user(clip0)]]", "[[render_target_array_index]]", "[[viewport_array_index]]"})
+			check(complex_msl.find(fixed) != std::string::npos, std::string("Selected replay lost fixed raster output: ") + fixed);
+		write(directory, "complex-selected", complex_msl);
+		if (!dense.empty())
+		{
+			CompilerMSL dense_capture(dense), dense_full(dense), dense_selected(dense);
+			configure(dense_capture, true);
+			configure(dense_full);
+			configure(dense_selected);
+			auto dense_capture_msl = dense_capture.compile();
+			auto dense_layout = dense_capture.get_msl_captured_vertex_layout();
+			check(dense_layout.components.size() == 120 && dense_layout.builtins.size() == 4, "Dense capture did not retain all fixed Vulkan outputs.");
+			auto dense_binding = binding;
+			dense_binding.primitive_index_location = 30;
+			MSLCapturedOutputReplayBarycentricBinding dense_basis;
+			dense_basis.corner_buffer_index = 3;
+			dense_basis.perspective_location = 31;
+			dense_basis.no_perspective_location = 32;
+			auto full_msl = dense_full.compile_captured_output_replay(dense_layout, dense_binding, dense_basis);
+			auto selected_msl = dense_selected.compile_captured_output_replay(dense_layout, dense_binding, dense_basis, std::vector<uint32_t>{0});
+			check(count(full_msl, "[[user(locn") == 33 && count(selected_msl, "[[user(locn") == 4, "Dense replay did not reduce 30 user varyings to the single requested Location and three private varyings.");
+			check(full_msl.find("value29 [[user(locn29)]]") != std::string::npos && selected_msl.find("value29") == std::string::npos, "Dense replay retained an unconsumed output.");
+			check(selected_msl.find("value0 [[user(locn0)]]") != std::string::npos && selected_msl.find("[[position]]") != std::string::npos, "Dense replay lost its selected or fixed output.");
+			std::map<uint32_t, uint32_t> captured_widths;
+			for (const auto &field : dense_layout.components)
+				captured_widths[field.location] = std::max(captured_widths[field.location], field.component + 1);
+			uint32_t full_components = 7, selected_components = 7; // Primitive key and two float3 barycentric bases.
+			for (const auto &width : captured_widths)
+			{
+				full_components += width.second;
+				if (width.first == 0)
+					selected_components += width.second;
+			}
+			check(full_components == 127 && selected_components == 11 && full_components > 124 && selected_components <= 124, "Selected replay did not cross the illustrative 124-component capacity boundary.");
+			write(directory, "dense-capture", dense_capture_msl);
+			write(directory, "dense-selected", selected_msl);
+		}
 		for (uint32_t mode = 0; mode < 3; mode++)
 		{
 			CompilerMSL capture(complex), normal(complex), replay(complex);

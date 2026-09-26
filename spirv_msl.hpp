@@ -775,6 +775,15 @@ public:
 	// Requires a distinct corner buffer; caller supplies the original triangle corner
 	// order, bounds and values in [0, 2]. Never inferred from vertex/record IDs.
 	std::string compile_captured_output_replay(const MSLCapturedVertexLayout &layout, const MSLCapturedOutputReplayBinding &binding, const MSLCapturedOutputReplayBarycentricBinding &barycentrics);
+	// Emit only the listed user output Locations in the raster replay. An empty list
+	// emits no user varyings. The capture record and fixed raster builtins remain
+	// unchanged. The caller must include every ordinary fragment input Location;
+	// PerVertexKHR inputs read the capture record and need not be replay varyings.
+	// Selection is by whole Location, including all Components. A composite that
+	// cannot be selected at this granularity throws rather than silently widening
+	// or dropping the interface. Existing overloads continue to replay everything.
+	// Invalid or unrepresentable selections throw instead of dropping a requested input.
+	std::string compile_captured_output_replay(const MSLCapturedVertexLayout &layout, const MSLCapturedOutputReplayBinding &binding, const MSLCapturedOutputReplayBarycentricBinding &barycentrics, const std::vector<uint32_t> &user_locations);
 
 	// Opt in to portable fragment PerVertexKHR inputs (MSL >= 2.4).
 	// Mutually exclusive with supports_per_vertex_fragment_input for active PerVertex inputs.
@@ -926,6 +935,7 @@ public:
 	uint32_t get_fp_fast_math_flags(bool incl_ops) const;
 
 protected:
+	std::string compile_captured_output_replay_impl(const MSLCapturedVertexLayout &layout, const MSLCapturedOutputReplayBinding &binding, const MSLCapturedOutputReplayBarycentricBinding &barycentrics, const std::vector<uint32_t> *user_locations);
 	// An enum of SPIR-V functions that are implemented in additional
 	// source code that is added to the shader if necessary.
 	enum SPVFuncImpl : uint8_t
