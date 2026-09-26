@@ -222,6 +222,82 @@ int main(int argc, char **argv)
 					check(msl.find("out.gl_Position[3] =") < msl.find(clip ? "Adjust clip-space" : "Invert Y-axis"), "Fixup precedes captured Position load.");
 				write(directory, std::string("fixups-") + (clip ? "clip" : "no-clip") + (flip ? "-flip" : "-no-flip"), msl);
 			}
+		for (uint32_t viewport = 0; viewport < 2; viewport++)
+			for (bool compute : {false, true})
+				for (bool clip : {false, true})
+					for (bool flip : {false, true})
+					{
+						const auto &words = viewport == 0 ? simple : complex;
+						CompilerMSL capture(words), normal(words), replay(words);
+						configure(capture, true, false, compute);
+						configure(normal);
+						configure(replay);
+						for (auto compiler : {&capture, &normal, &replay})
+						{
+							auto options = compiler->get_msl_options();
+							options.emulate_reversed_depth_viewport = true;
+							options.reversed_depth_viewport_buffer_index = 30;
+							compiler->set_msl_options(options);
+							auto common = compiler->get_common_options();
+							common.vertex.fixup_clipspace = clip;
+							common.vertex.flip_vert_y = flip;
+							compiler->set_common_options(common);
+						}
+						auto producer = capture.compile();
+						auto raster = normal.compile();
+						auto msl = replay.compile_captured_output_replay(capture.get_msl_captured_vertex_layout(), binding);
+						check_interface(raster, msl);
+						const std::string argument = "constant uint& spvEmulatedReversedDepthViewportMask [[buffer(30)]]";
+						const std::string guard = viewport == 1 ? "if (((spvEmulatedReversedDepthViewportMask >> uint(out.gl_ViewportIndex)) & 1u) != 0u)" : "if ((spvEmulatedReversedDepthViewportMask & 1u) != 0u)";
+						const std::string correction = "out.gl_Position.z = out.gl_Position.w - out.gl_Position.z;    // Emulate reversed-depth viewport";
+						check(producer.find("spvEmulatedReversedDepthViewportMask") == std::string::npos && count(producer, "Emulate reversed-depth viewport") == 0 && count(producer, "Adjust clip-space") == 0 && count(producer, "Invert Y-axis") == 0, "Capture must leave Position uncorrected and require no mask.");
+						check(count(msl, "[[buffer(") == 4, "Enabled replay must emit exactly four buffers.");
+						for (const auto &source : {raster, msl})
+						{
+							check(count(source, argument) == 1 && count(source, guard) == 1 && count(source, correction) == 1, "Ordinary/replay reversed-depth argument, viewport selection or correction differs.");
+							check(count(source, "Adjust clip-space") == size_t(clip) && count(source, "Invert Y-axis") == size_t(flip), "Reversed-depth raster fixups missing or repeated.");
+							check(!clip || source.find("Adjust clip-space") < source.find(guard), "Clip conversion must precede reversed depth.");
+							check(!flip || source.find(correction) < source.find("Invert Y-axis"), "Y inversion must follow reversed depth.");
+						}
+						check(msl.rfind("reinterpret_cast<const device ") < msl.find(guard) && msl.find(correction) < msl.find("return out;"), "Replay must correct depth after captured loads and before return.");
+						if (viewport == 1)
+							check(count(msl, "out.gl_ViewportIndex = *reinterpret_cast<const device uint*>(spvReplayRecord + 96ul)") == 1, "Viewport selection must use the captured ViewportIndex.");
+						else
+							check(msl.find("gl_ViewportIndex") == std::string::npos, "Absent/masked ViewportIndex must use viewport zero.");
+						std::string name = "reversed-" + std::to_string(viewport) + (compute ? "-compute" : "-vertex") + (clip ? "-clip" : "-no-clip") + (flip ? "-flip" : "-no-flip");
+						write(directory, name + "-capture", producer);
+						write(directory, name + "-normal", raster);
+						write(directory, name + "-replay", msl);
+					}
+		CompilerMSL viewport_capture(complex), masked_viewport_replay(complex);
+		configure(viewport_capture, true);
+		configure(masked_viewport_replay);
+		viewport_capture.compile();
+		masked_viewport_replay.mask_stage_output_by_builtin(spv::BuiltInViewportIndex);
+		auto masked_options = masked_viewport_replay.get_msl_options();
+		masked_options.emulate_reversed_depth_viewport = true;
+		masked_options.reversed_depth_viewport_buffer_index = 3;
+		masked_viewport_replay.set_msl_options(masked_options);
+		auto masked_msl = masked_viewport_replay.compile_captured_output_replay(viewport_capture.get_msl_captured_vertex_layout(), binding);
+		check(masked_msl.find("gl_ViewportIndex") == std::string::npos && count(masked_msl, "if ((spvEmulatedReversedDepthViewportMask & 1u) != 0u)") == 1, "Masked ViewportIndex must use viewport zero.");
+		write(directory, "reversed-masked-replay", masked_msl);
+		CompilerMSL default_replay(simple);
+		configure(default_replay);
+		auto default_msl = default_replay.compile_captured_output_replay(simple_layout, binding);
+		for (uint32_t slot : {0u, 1u, 2u, 31u, ~0u})
+			for (bool enabled : {false, true})
+			{
+				CompilerMSL compiler(simple);
+				configure(compiler);
+				auto options = compiler.get_msl_options();
+				options.emulate_reversed_depth_viewport = enabled;
+				options.reversed_depth_viewport_buffer_index = slot;
+				compiler.set_msl_options(options);
+				if (enabled)
+					rejects([&]() { compiler.compile_captured_output_replay(simple_layout, binding); }, "reversed-depth viewport mask buffer index");
+				else
+					check(compiler.compile_captured_output_replay(simple_layout, binding) == default_msl, "Disabled reversed-depth option must ignore the mask slot and preserve replay ABI/source.");
+			}
 		auto reject_layout = [&](MSLCapturedVertexLayout layout, const char *diagnostic) {
 			CompilerMSL compiler(simple);
 			configure(compiler);
@@ -275,7 +351,7 @@ int main(int argc, char **argv)
 			case 3: options.capture_output_to_buffer = true; diagnostic = "normal rasterizing"; break;
 			case 4: options.vertex_for_tessellation = true; diagnostic = "normal rasterizing"; break;
 			case 5: options.multiview = true; diagnostic = "does not support multiview"; break;
-			case 6: options.emulate_depth_clip_enable = true; diagnostic = "depth/viewport emulation"; break;
+			case 6: options.emulate_depth_clip_enable = true; diagnostic = "depth-clip emulation"; break;
 			case 7: options.enable_point_size_default = true; diagnostic = "default PointSize"; break;
 			default: options.set_msl_version(2, 3); diagnostic = "MSL 2.4"; break;
 			}
