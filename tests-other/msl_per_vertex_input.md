@@ -1,6 +1,6 @@
 # Portable captured PerVertexKHR input ABI
 
-This is a compiler-side subset, not a capture/replay implementation or a claim of GPU support on all Macs. Configure `CompilerMSL` before compilation. The C++ API is intended for callers such as MoltenVK; no C API or CLI layout syntax is added.
+This is a compiler-side subset, not a runtime capture/replay system or a claim of GPU support on all Macs. Configure `CompilerMSL` before compilation. The C++ API is intended for callers such as MoltenVK; no C API or CLI layout syntax is added.
 
 ## Selecting the path
 
@@ -37,11 +37,11 @@ The simple regression exports stride **32** and color offsets **0/4/8** for `flo
 
 `layout.builtins` contains `MSLCapturedVertexBuiltin` scalar descriptors keyed by `(builtin, array_index, component)`, with `byte_offset` and `scalar_type`. Scalar builtins use both indices zero. Position uses `array_index = 0`, components 0..3; ClipDistance uses its array index with component zero. Each offset is absolute within the captured record. Types describe the emitted Metal representation: for example Layer and ViewportIndex are `UInt`, even when the source SPIR-V uses signed int. Builtins remain separate from the application Location/Component namespace, including when a builtin is assigned a linkage location. `set_msl_per_vertex_input_buffer()` ignores this replay metadata and reads only `components`.
 
-Replay can reconstruct a builtin using `load<field.scalar_type>(captured + uint64(record) * layout.stride + field.byte_offset)` for each of its scalar descriptors. The simple fixture verifies Position at offsets **16/20/24/28**. The complex fixture verifies Position at **64/68/72/76**, PointSize at **80**, ClipDistance[0..1] at **84/88**, Layer at **92**, and ViewportIndex at **96**. All are checked against the actual MSL type with compile-time assertions; masked builtins have no descriptor. This provides the data needed to replay captured builtins without executing application SPIR-V. It does not yet generate the replay shader or select which builtins the render pipeline permits/needs.
+Replay reconstructs a builtin using `load<field.scalar_type>(captured + uint64(record) * layout.stride + field.byte_offset)` for each of its scalar descriptors. The simple fixture verifies Position at offsets **16/20/24/28**. The complex fixture verifies Position at **64/68/72/76**, PointSize at **80**, ClipDistance[0..1] at **84/88**, Layer at **92**, and ViewportIndex at **96**. All are checked against the actual MSL type with compile-time assertions; masked builtins have no descriptor. The separate `compile_captured_output_replay()` API uses this metadata to generate a vertex replay shader without executing application SPIR-V. The caller still selects which builtins the render pipeline permits/needs.
 
 The runtime must still implement the producer's capture index formula and construct the primitive table against those actual record indices. A correct layout does not establish draw/instance/topology mapping or memory visibility. Include both producer compilation options and the exported layout in the existing pipeline/cache compatibility decisions.
 
-The masking regression covers PointSize and ClipDistance. Masking Layer on the mixed fixture currently emits an undeclared `gl_Layer` assignment in the backend; that configuration is not validated for integration. This getter describes the generated record, and does not certify that every backend option combination produces legal Metal. The proposed replay compiler contract is described separately in [msl_captured_output_replay.md](msl_captured_output_replay.md); replay generation is not implemented.
+The masking regression covers PointSize and ClipDistance. Masking Layer on the mixed fixture currently emits an undeclared `gl_Layer` assignment in the capture backend; that configuration is not validated for integration. This getter describes the generated record, and does not certify that every backend option combination produces legal Metal. The implemented vertex replay compiler subset is described separately in [msl_captured_output_replay.md](msl_captured_output_replay.md).
 
 `MSLPerVertexInputBinding` specifies:
 
@@ -84,7 +84,7 @@ compiler.set_msl_per_vertex_input_buffer(layout, binding);
 std::string msl = compiler.compile();
 ```
 
-MoltenVK must reserve both fragment buffer slots and the private interface location, supply the physical layout from the actual final producer, and include this configuration in shader/pipeline cache identity. `is_msl_shader_input_used()` still reports captured source locations; the private location is not exposed as an application input. The replay shader need not interpolate those captured inputs to the fragment. This compiler does not modify the producer or replay shader.
+MoltenVK must reserve both fragment buffer slots and the private interface location, supply the physical layout from the actual final producer, and include this configuration in shader/pipeline cache identity. `is_msl_shader_input_used()` still reports captured source locations; the private location is not exposed as an application input. The replay shader need not interpolate those captured inputs to the fragment. The fragment setter does not modify the producer or replay shader; compile those separately with their corresponding APIs.
 
 The runtime owns primitive assembly and ordering, base vertex/index handling, restart, degenerates, provoking vertex rules, instance/view selection, and point/line duplication into triplets. Shared indexed vertices may need separate replay occurrences to carry distinct primitive keys. Capture must occur at the last relevant vertex-producing stage. Replay must not repeat application shader side effects. Writes must be visible before fragment reads, including the requirements of the active render pass and transient attachments. None of these runtime properties is proven by syntax tests.
 
