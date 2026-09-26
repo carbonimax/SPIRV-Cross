@@ -125,7 +125,7 @@ int main(int argc, char **argv)
 {
 	try
 	{
-		check(argc == 11 || argc == 12, "Usage: test portable.spv interpolate.spv block.spv copied_pointer.spv explicit_only.spv mixed_block.spv mixed_frontfacing.spv mixed_builtins.spv multiword_mask.spv per_vertex.spv [output-directory]");
+		check(argc == 13 || argc == 14, "Usage: test portable.spv interpolate.spv block.spv copied_pointer.spv explicit_only.spv mixed_block.spv mixed_frontfacing.spv mixed_builtins.spv multiword_mask.spv inactive_block.spv empty_root.spv per_vertex.spv [output-directory]");
 		auto plain = read_spirv(argv[1]);
 		auto pull = read_spirv(argv[2]);
 		auto block = read_spirv(argv[3]);
@@ -135,8 +135,35 @@ int main(int argc, char **argv)
 		auto mixed_frontfacing = read_spirv(argv[7]);
 		auto mixed_builtins = read_spirv(argv[8]);
 		auto multiword_mask = read_spirv(argv[9]);
-		auto per_vertex = read_spirv(argv[10]);
-		std::string directory = argc == 12 ? argv[11] : "";
+		auto inactive_block = read_spirv(argv[10]);
+		auto empty_root = read_spirv(argv[11]);
+		auto per_vertex = read_spirv(argv[12]);
+		std::string directory = argc == 14 ? argv[13] : "";
+		for (const char *entry : {"load", "at_centroid"})
+		{
+			CompilerMSL compiler(empty_root);
+			configure(compiler, entry);
+			compiler.set_msl_fragment_barycentric_input(binding());
+			auto source = compiler.compile();
+			write_shader(directory, std::string("empty-root-") + entry, source);
+			check(compiler.has_active_builtin(spv::BuiltInBaryCoordKHR, spv::StorageClassInput), "Empty root alias lost active BaryCoordKHR.");
+			check(source.find("user(locn12)") != std::string::npos, "Empty root alias lost the portable barycentric input.");
+			check(source.find("float4(in.gl_BaryCoordEXT") != std::string::npos, "Empty root alias did not read the barycentric member.");
+			check(source.find("user(locn14)") == std::string::npos, "Empty root alias activated an unused barycentric member.");
+			if (std::string(entry) == "at_centroid")
+				check(source.find(".interpolate_at_centroid()") != std::string::npos, "Empty root alias lost explicit interpolation.");
+			CompilerMSL native(empty_root);
+			configure(native, entry);
+			rejects([&]() { native.compile(); }, "Member-decorated barycentric inputs require portable fragment input mode in MSL.");
+		}
+		CompilerMSL ordinary(inactive_block);
+		configure(ordinary, "ordinary");
+		auto ordinary_source = ordinary.compile();
+		write_shader(directory, "inactive-barycentric-ordinary", ordinary_source);
+		check(ordinary_source.find("float4 gl_FragCoord [[position]]") != std::string::npos, "Active FragCoord member has no native MSL input.");
+		check(ordinary_source.find(" = gl_FragCoord;") != std::string::npos, "Active FragCoord member was not read from its native input.");
+		check(ordinary_source.find("gl_FragCoord.xy += get_sample_position(gl_SampleID) - 0.5") != std::string::npos, "Active FragCoord member lost sample-rate correction.");
+		check(ordinary_source.find("barycentric_coord") == std::string::npos && ordinary_source.find("interpolant<") == std::string::npos, "Inactive barycentric members were emitted.");
 		CompilerMSL multiword(multiword_mask);
 		configure(multiword);
 		multiword.set_msl_fragment_barycentric_input(binding());

@@ -459,28 +459,48 @@ uint32_t CompilerMSL::portable_barycentric_location(BuiltIn builtin) const
 
 void CompilerMSL::prepare_fragment_barycentric_input()
 {
-	if (!fragment_barycentric_input_enabled)
-		return;
 	if (get_execution_model() != ExecutionModelFragment)
-		SPIRV_CROSS_THROW("Portable barycentric inputs require a fragment entry point.");
-	if (!msl_options.supports_msl_version(2, 4))
+	{
+		if (fragment_barycentric_input_enabled)
+			SPIRV_CROSS_THROW("Portable barycentric inputs require a fragment entry point.");
+		return;
+	}
+	if (fragment_barycentric_input_enabled && !msl_options.supports_msl_version(2, 4))
 		SPIRV_CROSS_THROW("Portable barycentric inputs require MSL 2.4 or later.");
+	// The same member lowering is needed for ordinary active builtins in input
+	// blocks even when portable barycentric interpolation was not requested.
+	if (!fragment_barycentric_input_enabled)
+	{
+		bool has_builtin_input_block = false;
+		ir.for_each_typed_id<SPIRVariable>([&](uint32_t id, const SPIRVariable &var) {
+			if (var.storage == StorageClassInput && interface_variable_exists_in_entry_point(id))
+			{
+				const auto &type = get_variable_data_type(var);
+				has_builtin_input_block |= type.basetype == SPIRType::Struct && has_decoration(type.self, DecorationBlock) && is_builtin_variable(var);
+			}
+		});
+		if (!has_builtin_input_block)
+			return;
+	}
 	std::unordered_set<uint32_t> reachable_blocks;
 	for (const auto &cfg : function_cfgs)
 		for (auto block : get<SPIRFunction>(cfg.first).blocks)
 			reachable_blocks.insert(block);
-	std::unordered_map<uint32_t, uint32_t> copied_pointers;
+	std::unordered_map<uint32_t, uint32_t> pointer_aliases;
 	ir.for_each_typed_id<SPIRBlock>([&](uint32_t, SPIRBlock &block) {
 		for (auto &instruction : block.ops)
-			if (instruction.op == OpCopyObject)
+			if (instruction.op == OpCopyObject ||
+			    ((instruction.op == OpAccessChain || instruction.op == OpInBoundsAccessChain) && instruction.length == 3))
 			{
 				auto ops = stream(instruction);
-				if (get<SPIRType>(ops[0]).pointer)
-					copied_pointers[ops[1]] = ops[2];
+				const auto &type = get<SPIRType>(ops[0]);
+				if (type.pointer && (instruction.op == OpCopyObject || type.storage == StorageClassInput))
+					pointer_aliases[ops[1]] = ops[2];
 			}
 	});
 	// Builtin activity analysis sees direct access-chain bases, so resolve
-	// pointer copies before deciding which block members need lowering.
+	// pointer copies and index-free access chains before deciding which block
+	// members need lowering. An index-free chain is only a pointer alias.
 	ir.for_each_typed_id<SPIRBlock>([&](uint32_t, SPIRBlock &block) {
 		if (!reachable_blocks.count(block.self))
 			return;
@@ -490,25 +510,30 @@ void CompilerMSL::prepare_fragment_barycentric_input()
 				continue;
 			auto ops = stream_mutable(instruction);
 			if (get<SPIRType>(ops[0]).storage == StorageClassInput)
-				while (copied_pointers.count(ops[2]))
-					ops[2] = copied_pointers.at(ops[2]);
+			{
+				while (pointer_aliases.count(ops[2]))
+					ops[2] = pointer_aliases.at(ops[2]);
+				if (instruction.length == 3)
+					instruction.op = OpCopyObject;
+			}
 		}
 	});
 	update_active_builtins();
 	// The general builtin analysis misses whole-variable InterpolateAt* operands.
 	// Interface activity already tracks those reads, including reads in helpers.
-	for (auto id : get_active_interface_variables())
-		if (has_decoration(id, DecorationBuiltIn))
-		{
-			auto builtin = BuiltIn(get_decoration(id, DecorationBuiltIn));
-			if (is_portable_barycentric(builtin))
-				active_input_builtins.set(builtin);
-		}
+	if (fragment_barycentric_input_enabled)
+		for (auto id : get_active_interface_variables())
+			if (has_decoration(id, DecorationBuiltIn))
+			{
+				auto builtin = BuiltIn(get_decoration(id, DecorationBuiltIn));
+				if (is_portable_barycentric(builtin))
+					active_input_builtins.set(builtin);
+			}
 	bool perspective = has_active_builtin(BuiltInBaryCoordKHR, StorageClassInput);
 	bool linear = has_active_builtin(BuiltInBaryCoordNoPerspKHR, StorageClassInput);
-	if ((perspective && fragment_barycentric_input_binding.perspective_location == k_unknown_location) || (linear && fragment_barycentric_input_binding.no_perspective_location == k_unknown_location))
+	if (fragment_barycentric_input_enabled && ((perspective && fragment_barycentric_input_binding.perspective_location == k_unknown_location) || (linear && fragment_barycentric_input_binding.no_perspective_location == k_unknown_location)))
 		SPIRV_CROSS_THROW("Portable barycentric inputs require a private Location for each active builtin.");
-	if (perspective && linear && fragment_barycentric_input_binding.perspective_location == fragment_barycentric_input_binding.no_perspective_location)
+	if (fragment_barycentric_input_enabled && perspective && linear && fragment_barycentric_input_binding.perspective_location == fragment_barycentric_input_binding.no_perspective_location)
 		SPIRV_CROSS_THROW("Portable barycentric inputs require distinct private Locations for the two builtins.");
 	auto validate = [&](BuiltIn builtin, const SPIRType &type, const Bitset &flags) {
 		if (!is_portable_barycentric(builtin) || !has_active_builtin(builtin, StorageClassInput))
@@ -533,8 +558,6 @@ void CompilerMSL::prepare_fragment_barycentric_input()
 			for (uint32_t i = 0; i < type.member_types.size(); i++)
 				if (has_member_decoration(type.self, i, DecorationBuiltIn) && is_portable_barycentric(BuiltIn(get_member_decoration(type.self, i, DecorationBuiltIn))))
 					barycentric_block = true;
-			if (barycentric_block)
-				fragment_barycentric_input_blocks.insert(id);
 			for (uint32_t i = 0; i < type.member_types.size(); i++)
 				if (has_member_decoration(type.self, i, DecorationBuiltIn))
 				{
@@ -542,8 +565,15 @@ void CompilerMSL::prepare_fragment_barycentric_input()
 					flags.merge_or(get_decoration_bitset(id));
 					auto builtin = BuiltIn(get_member_decoration(type.self, i, DecorationBuiltIn));
 					validate(builtin, get<SPIRType>(type.member_types[i]), flags);
-					if (!barycentric_block || is_portable_barycentric(builtin) || !has_active_builtin(builtin, StorageClassInput))
+					if (!has_active_builtin(builtin, StorageClassInput))
 						continue;
+					if (builtin == BuiltInBaryCoordKHR || builtin == BuiltInBaryCoordNoPerspKHR)
+					{
+						if (!fragment_barycentric_input_enabled)
+							SPIRV_CROSS_THROW("Member-decorated barycentric inputs require portable fragment input mode in MSL.");
+						continue;
+					}
+					fragment_barycentric_input_blocks.insert(id);
 					const auto &member_type = get<SPIRType>(type.member_types[i]);
 					if (builtin == BuiltInSampleMask && (member_type.array.size() != 1 || !member_type.array_size_literal[0] || member_type.array[0] != 1))
 						SPIRV_CROSS_THROW("MSL fragment input blocks with builtin members require a single SampleMask word.");
@@ -570,14 +600,16 @@ void CompilerMSL::prepare_fragment_barycentric_input()
 						SPIRV_CROSS_THROW(join("MSL fragment input blocks with builtin members do not support active builtin ", uint32_t(builtin), "."));
 					}
 				}
+			if (barycentric_block)
+				fragment_barycentric_input_blocks.insert(id);
 		}
 	});
 	for (const auto &member : builtin_members)
 	{
 		if (fragment_barycentric_builtin_ids.count(member.first))
 			continue;
-		// Keep ordinary builtins out of the block's pull-model interpolants.
-		// Their existing lowering also supplies position and sample fixups.
+		// Use standalone builtin lowering for active block members. It supplies
+		// native stage inputs and the position and sample fixups.
 		uint32_t type_id = member.second.first;
 		uint32_t member_index = member.second.second;
 		uint32_t member_type = get<SPIRType>(type_id).member_types[member_index];
@@ -605,8 +637,8 @@ void CompilerMSL::prepare_fragment_barycentric_input()
 				continue;
 			auto ops = stream_mutable(instruction);
 			uint32_t base = ops[2];
-			while (copied_pointers.count(base))
-				base = copied_pointers.at(base);
+			while (pointer_aliases.count(base))
+				base = pointer_aliases.at(base);
 			if (!fragment_barycentric_input_blocks.count(base))
 				continue;
 			const auto &type = get_variable_data_type(get<SPIRVariable>(base));
