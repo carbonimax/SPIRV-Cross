@@ -99,6 +99,116 @@ static void rejects(const std::function<void()> &operation, const char *diagnost
 	throw std::runtime_error(std::string("Expected diagnostic: ") + diagnostic);
 }
 
+static void check_barycentric_replay(const std::vector<uint32_t> &words, const MSLCapturedOutputReplayBinding &binding, const std::string &directory, const std::string &name)
+{
+	CompilerMSL capture(words);
+	configure(capture, true);
+	capture.compile();
+	auto layout = capture.get_msl_captured_vertex_layout();
+	for (uint32_t mode = 1; mode <= 3; mode++)
+		for (uint32_t fixups = 0; fixups < 4; fixups++)
+		{
+			MSLCapturedOutputReplayBarycentricBinding barycentrics;
+			barycentrics.corner_buffer_index = 30;
+			barycentrics.perspective_location = (mode & 1) ? 12u : ~0u;
+			barycentrics.no_perspective_location = (mode & 2) ? 14u : ~0u;
+			CompilerMSL replay(words), ordinary(words), disabled(words);
+			for (auto compiler : {&replay, &ordinary, &disabled})
+			{
+				configure(*compiler);
+				auto options = compiler->get_msl_options();
+				options.emulate_reversed_depth_viewport = true;
+				options.reversed_depth_viewport_buffer_index = 29;
+				compiler->set_msl_options(options);
+				auto common = compiler->get_common_options();
+				common.vertex.fixup_clipspace = (fixups & 1) != 0;
+				common.vertex.flip_vert_y = (fixups & 2) != 0;
+				compiler->set_common_options(common);
+			}
+			auto original = ordinary.compile_captured_output_replay(layout, binding);
+			check(disabled.compile_captured_output_replay(layout, binding, {}) == original, "Default barycentric binding changed legacy replay source.");
+			auto msl = replay.compile_captured_output_replay(layout, binding, barycentrics);
+			check(count(msl, "[[buffer(") == 5, "Barycentric replay must add exactly one corner buffer.");
+			const std::string argument = ", const device uint* spvReplayCorners [[buffer(30)]]";
+			check(count(msl, argument) == 1, "Missing explicit corner buffer argument.");
+			check(count(msl, "uint spvReplayCorner = spvReplayCorners[spvReplayOccurrence];") == 1, "Corner must use the explicit normalized occurrence address.");
+			check(msl.find('%') == std::string::npos && msl.find("barycentric_coord") == std::string::npos, "Replay inferred a corner or used native barycentrics.");
+			for (uint32_t bit = 1; bit <= 2; bit++)
+			{
+				std::string field = bit == 1 ? "spvReplayBarycentric" : "spvReplayBarycentricNoPersp";
+				std::string location = bit == 1 ? "12" : "14";
+				check(count(msl, "float3 " + field + " [[user(locn" + location + ")]];") == ((mode & bit) ? 1u : 0u), "Incorrect barycentric output type, location or interpolation qualifier.");
+				check(count(msl, "out." + field + " = float3(spvReplayCorner == 0u, spvReplayCorner == 1u, spvReplayCorner == 2u);") == ((mode & bit) ? 1u : 0u), "Basis must be unscaled one-hot for the explicit corner.");
+				check(!replay.is_msl_shader_output_used(bit == 1 ? 12 : 14), "Private basis leaked into application output reflection.");
+			}
+			// Removing only the optional interface, argument and basis must recover every
+			// captured scalar load, primitive key, Position component and fixup unchanged.
+			auto stripped = msl;
+			stripped.erase(stripped.find(argument), argument.size());
+			for (size_t pos; (pos = stripped.find("spvReplayCorner")) != std::string::npos;)
+			{
+				auto begin = stripped.rfind('\n', pos);
+				stripped.erase(begin, stripped.find('\n', pos) - begin);
+			}
+			for (size_t pos; (pos = stripped.find("spvReplayBarycentric")) != std::string::npos;)
+			{
+				auto begin = stripped.rfind('\n', pos);
+				stripped.erase(begin, stripped.find('\n', pos) - begin);
+			}
+			check(stripped == original, "Barycentric output changed captured outputs, Position, primitive key, addressing or fixups.");
+			write(directory, name + "-barycentric-" + std::to_string(mode) + "-fixups-" + std::to_string(fixups), msl);
+		}
+	MSLCapturedOutputReplayBarycentricBinding barycentrics;
+	barycentrics.corner_buffer_index = 30;
+	barycentrics.perspective_location = 12;
+	barycentrics.no_perspective_location = 14;
+	for (uint32_t slot : {0u, 1u, 2u, 29u, 31u, ~0u})
+	{
+		CompilerMSL compiler(words);
+		configure(compiler);
+		auto options = compiler.get_msl_options();
+		options.emulate_reversed_depth_viewport = true;
+		options.reversed_depth_viewport_buffer_index = 29;
+		compiler.set_msl_options(options);
+		auto bad = barycentrics;
+		bad.corner_buffer_index = slot;
+		rejects([&]() { compiler.compile_captured_output_replay(layout, binding, bad); }, "corner buffer index");
+	}
+	for (uint32_t failure = 0; failure < 8; failure++)
+	{
+		CompilerMSL compiler(words);
+		configure(compiler);
+		auto bad = barycentrics;
+		auto bad_layout = layout;
+		const char *diagnostic = nullptr;
+		switch (failure)
+		{
+		case 0: bad.perspective_location = bad.no_perspective_location = ~0u; diagnostic = "at least one private Location"; break;
+		case 1: bad.no_perspective_location = bad.perspective_location; diagnostic = "distinct private Locations"; break;
+		case 2: bad.perspective_location = binding.primitive_index_location; diagnostic = "primitive key"; break;
+		case 3: bad.no_perspective_location = binding.primitive_index_location; diagnostic = "primitive key"; break;
+		case 4: bad.perspective_location = layout.components.front().location; diagnostic = "captured layout"; break;
+		case 5: bad.no_perspective_location = layout.components.front().location; diagnostic = "captured layout"; break;
+		case 6:
+		{
+			MSLShaderInterfaceVariable output;
+			output.location = 12;
+			output.component = 2;
+			compiler.add_msl_shader_output(output);
+			diagnostic = "MSL shader output mapping";
+			break;
+		}
+		case 7:
+			bad.perspective_location = layout.components.front().location;
+			bad_layout.components.clear();
+			diagnostic = "raster output interface";
+			break;
+		}
+		rejects([&]() { compiler.compile_captured_output_replay(bad_layout, binding, bad); }, diagnostic);
+		rejects([&]() { compiler.compile_captured_output_replay(layout, binding); }, "fresh compiler");
+	}
+}
+
 int main(int argc, char **argv)
 {
 	try
@@ -115,6 +225,9 @@ int main(int argc, char **argv)
 		binding.occurrence_buffer_index = 1;
 		binding.draw_parameters_buffer_index = 2;
 		binding.primitive_index_location = 15;
+		check_barycentric_replay(simple, binding, directory, "simple");
+		check_barycentric_replay(complex, binding, directory, "complex");
+		check_barycentric_replay(effects, binding, directory, "effects");
 		MSLCapturedVertexLayout simple_layout;
 		for (uint32_t fixture = 0; fixture < 3; fixture++)
 			for (bool native_arrays : {false, true})
