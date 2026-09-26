@@ -26,6 +26,7 @@
 
 #include <algorithm>
 #include <assert.h>
+#include <iterator>
 #include <numeric>
 
 using namespace SPIRV_CROSS_SPV_HEADER_NAMESPACE;
@@ -54,6 +55,128 @@ CompilerMSL::CompilerMSL(const ParsedIR &ir_)
 CompilerMSL::CompilerMSL(ParsedIR &&ir_)
     : CompilerGLSL(std::move(ir_))
 {
+}
+
+void CompilerMSL::set_msl_per_vertex_input_buffer(const MSLCapturedVertexLayout &layout, const MSLPerVertexInputBinding &binding)
+{
+	per_vertex_input_layout = layout;
+	per_vertex_input_binding = binding;
+	per_vertex_input_buffer_enabled = true;
+}
+
+void CompilerMSL::validate_per_vertex_input_buffer()
+{
+	if (!msl_options.supports_msl_version(2, 4))
+		SPIRV_CROSS_THROW("Portable PerVertexKHR inputs require MSL 2.4 or later.");
+	if (msl_options.supports_per_vertex_fragment_input)
+		SPIRV_CROSS_THROW("Portable and native PerVertexKHR input modes are mutually exclusive.");
+	if (capture_output_to_buffer)
+		SPIRV_CROSS_THROW("Portable PerVertexKHR inputs cannot be combined with capture_output_to_buffer.");
+	const auto &binding = per_vertex_input_binding;
+	if (binding.vertex_buffer_index > 30 || binding.primitive_index_buffer_index > 30 || binding.vertex_buffer_index == binding.primitive_index_buffer_index)
+		SPIRV_CROSS_THROW("Portable PerVertexKHR requires two distinct Metal buffer indices in [0, 30].");
+	if (binding.primitive_index_location == k_unknown_location)
+		SPIRV_CROSS_THROW("Portable PerVertexKHR requires a private primitive index Location.");
+	if (!per_vertex_input_layout.stride || per_vertex_input_layout.components.empty())
+		SPIRV_CROSS_THROW("Portable PerVertexKHR requires a nonzero producer stride and scalar layout.");
+	per_vertex_input_components.clear();
+	std::map<uint32_t, uint32_t> ranges;
+	for (const auto &field : per_vertex_input_layout.components)
+	{
+		uint32_t size;
+		switch (field.scalar_type)
+		{
+		case SPIRType::Half:
+		case SPIRType::Short:
+		case SPIRType::UShort:
+			size = 2;
+			break;
+		case SPIRType::Float:
+		case SPIRType::Int:
+		case SPIRType::UInt:
+			size = 4;
+			break;
+		default:
+			SPIRV_CROSS_THROW("Portable PerVertexKHR layout requires 16/32-bit floating-point or integer scalar types.");
+		}
+		if (field.location == k_unknown_location || field.component > 3)
+			SPIRV_CROSS_THROW("Portable PerVertexKHR layout has invalid Location/Component.");
+		if (field.location == binding.primitive_index_location)
+			SPIRV_CROSS_THROW("Portable PerVertexKHR private Location collides with the producer layout.");
+		if (field.byte_offset % size || per_vertex_input_layout.stride % size)
+			SPIRV_CROSS_THROW("Portable PerVertexKHR scalar offsets and producer stride must be naturally aligned.");
+		if (size > per_vertex_input_layout.stride || field.byte_offset > per_vertex_input_layout.stride - size)
+			SPIRV_CROSS_THROW("Portable PerVertexKHR scalar lies outside the producer stride.");
+		if (!per_vertex_input_components.emplace(LocationComponentPair{field.location, field.component}, field).second)
+			SPIRV_CROSS_THROW("Portable PerVertexKHR layout has duplicate Location/Component.");
+		auto next = ranges.lower_bound(field.byte_offset);
+		if ((next != ranges.end() && next->first < field.byte_offset + size) || (next != ranges.begin() && std::prev(next)->second > field.byte_offset))
+			SPIRV_CROSS_THROW("Portable PerVertexKHR layout has overlapping scalar offsets.");
+		ranges.emplace(field.byte_offset, field.byte_offset + size);
+	}
+}
+
+void CompilerMSL::validate_per_vertex_buffer_binding(uint32_t index, uint32_t count) const
+{
+	if (!per_vertex_input_buffer_used)
+		return;
+	for (uint32_t reserved : { per_vertex_input_binding.vertex_buffer_index, per_vertex_input_binding.primitive_index_buffer_index })
+		if (index <= reserved && reserved - index < count)
+			SPIRV_CROSS_THROW(join("Portable PerVertexKHR buffer index ", reserved, " collides with another fragment buffer."));
+}
+
+void CompilerMSL::add_per_vertex_input_from_buffer(const string &ib_var_ref, const SPIRVariable &var)
+{
+	const auto &array_type = get_variable_data_type(var);
+	if (is_builtin_variable(var) || array_type.array.size() != 1 || !array_type.array_size_literal.back())
+		SPIRV_CROSS_THROW("Portable PerVertexKHR inputs must be non-builtin, one-dimensional literal arrays.");
+	uint32_t count = to_array_size_literal(array_type);
+	if (!count || count > 3)
+		SPIRV_CROSS_THROW("Portable PerVertexKHR input arrays must contain one to three vertices.");
+	const auto &type = get_variable_element_type(var);
+	if (is_array(type) || type.columns != 1 || type.basetype == SPIRType::Struct)
+		SPIRV_CROSS_THROW("Portable PerVertexKHR supports only scalar/vector elements; composites and matrices are not supported.");
+	if (type.basetype != SPIRType::Half && type.basetype != SPIRType::Short && type.basetype != SPIRType::UShort && type.basetype != SPIRType::Float && type.basetype != SPIRType::Int && type.basetype != SPIRType::UInt)
+		SPIRV_CROSS_THROW("Portable PerVertexKHR inputs require 16/32-bit floating-point or integer scalar/vector elements.");
+	if (!has_decoration(var.self, DecorationLocation))
+		SPIRV_CROSS_THROW("Portable PerVertexKHR input requires a Location decoration.");
+	uint32_t location = get_decoration(var.self, DecorationLocation);
+	uint32_t component = get_decoration(var.self, DecorationComponent);
+	if (!type.vecsize || type.vecsize > 4 || component > 3 || type.vecsize > 4 - component)
+		SPIRV_CROSS_THROW("Portable PerVertexKHR input crosses a Location boundary.");
+	// The physical producer layout is authoritative; do not apply vertex-attribute format remaps.
+	if (inputs_by_location.count({location, component}))
+		SPIRV_CROSS_THROW("Portable PerVertexKHR does not support add_msl_shader_input remapping for captured inputs.");
+	SmallVector<uint32_t> offsets;
+	for (uint32_t c = 0; c < type.vecsize; c++)
+	{
+		auto field = per_vertex_input_components.find({location, component + c});
+		if (field == per_vertex_input_components.end())
+			SPIRV_CROSS_THROW(join("Portable PerVertexKHR missing producer scalar at Location ", location, " Component ", component + c, "."));
+		if (field->second.scalar_type != type.basetype)
+			SPIRV_CROSS_THROW(join("Portable PerVertexKHR producer scalar type mismatch at Location ", location, " Component ", component + c, "."));
+		offsets.push_back(field->second.byte_offset);
+	}
+	add_resource_name(var.self);
+	emit_local_masked_variable(var, false);
+	mark_location_as_used_by_shader(location, type, StorageClassInput);
+	uint32_t var_id = var.self;
+	SPIRType scalar = type;
+	scalar.vecsize = 1;
+	get<SPIRFunction>(ir.default_entry_point).fixup_hooks_in.push_back([=]() {
+		for (uint32_t v = 0; v < count; v++)
+		{
+			string record = join("ulong(spvPerVertexIndices[ulong(", ib_var_ref, ".spvPerVertexPrimitive) * 3ul + ", v, "ul]) * ", per_vertex_input_layout.stride, "ul");
+			string value = type_to_glsl(type) + "(";
+			for (uint32_t c = 0; c < type.vecsize; c++)
+			{
+				if (c)
+					value += ", ";
+				value += join("*reinterpret_cast<const device ", type_to_glsl(scalar), "*>(spvPerVertexVertices + ", record, " + ", offsets[c], "ul)");
+			}
+			statement(to_name(var_id), "[", v, "] = ", value, ");");
+		}
+	});
 }
 
 void CompilerMSL::add_msl_shader_input(const MSLShaderInterfaceVariable &si)
@@ -3986,6 +4109,14 @@ void CompilerMSL::add_variable_to_interface_block(StorageClass storage, const st
 	{
 		if (get_execution_model() != ExecutionModelFragment)
 			SPIRV_CROSS_THROW("PerVertexKHR inputs are only supported in fragment shaders in MSL.");
+		if (per_vertex_input_buffer_enabled)
+		{
+			if (!per_vertex_input_buffer_used)
+				validate_per_vertex_input_buffer();
+			per_vertex_input_buffer_used = true;
+			add_per_vertex_input_from_buffer(ib_var_ref, var);
+			return;
+		}
 		if (!msl_options.supports_msl_version(4, 0))
 			SPIRV_CROSS_THROW("PerVertexKHR inputs require MSL 4.0 and a GPU supporting vertex_value.");
 		if (!msl_options.supports_per_vertex_fragment_input)
@@ -4828,6 +4959,18 @@ uint32_t CompilerMSL::add_interface_block(StorageClass storage, bool patch)
 			set_member_decoration(ib_type.self, ib_mbr_idx, DecorationCentroid);
 		if (location_meta.sample)
 			set_member_decoration(ib_type.self, ib_mbr_idx, DecorationSample);
+	}
+
+	if (storage == StorageClassInput && per_vertex_input_buffer_used)
+	{
+		uint32_t location = per_vertex_input_binding.primitive_index_location;
+		if (location_inputs_in_use.count(location))
+			SPIRV_CROSS_THROW("Portable PerVertexKHR private Location collides with a fragment input.");
+		uint32_t member = uint32_t(ib_type.member_types.size());
+		ib_type.member_types.push_back(get_uint_type_id());
+		set_member_name(ib_type.self, member, "spvPerVertexPrimitive");
+		set_member_decoration(ib_type.self, member, DecorationLocation, location);
+		set_member_decoration(ib_type.self, member, DecorationFlat);
 	}
 
 	// Sort the members of the structure by their locations.
@@ -15133,6 +15276,13 @@ bool CompilerMSL::is_intersection_query() const
 
 void CompilerMSL::entry_point_args_builtin(string &ep_args)
 {
+	if (per_vertex_input_buffer_used)
+	{
+		if (!ep_args.empty())
+			ep_args += ", ";
+		ep_args += join("const device uchar* spvPerVertexVertices [[buffer(", per_vertex_input_binding.vertex_buffer_index, ")]], const device uint* spvPerVertexIndices [[buffer(", per_vertex_input_binding.primitive_index_buffer_index, ")]]");
+	}
+
 	depth_clip_viewport_idx_var_name = "";
 
 	// Builtin variables
@@ -15228,6 +15378,7 @@ void CompilerMSL::entry_point_args_builtin(string &ep_args)
 
 	if (needs_depth_clip_state_buffer())
 	{
+		validate_per_vertex_buffer_binding(msl_options.depth_clip_state_buffer_index);
 		if (get_execution_model() == ExecutionModelFragment && msl_options.supports_msl_version(2, 0) &&
 		    depth_clip_viewport_idx_var_name.empty())
 		{
@@ -15473,6 +15624,7 @@ string CompilerMSL::entry_point_args_argument_buffer(bool append_comma)
 				buffer_binding = i;
 		}
 
+		validate_per_vertex_buffer_binding(buffer_binding);
 		claimed_bindings.set(buffer_binding);
 
 		ep_args += get_variable_address_space(var) + " ";
@@ -15664,6 +15816,10 @@ void CompilerMSL::entry_point_args_discrete_descriptors(string &ep_args)
 	{
 		auto &var = *r.var;
 		auto &type = get_variable_data_type(var);
+		if (is_var_runtime_size_array(var) || (r.basetype != SPIRType::Image && r.basetype != SPIRType::Sampler))
+			validate_per_vertex_buffer_binding(r.index, r.basetype == SPIRType::Struct && !type.array.empty() && !is_var_runtime_size_array(var) ? get_resource_array_size(type, var.self) : 1);
+		if (r.basetype == SPIRType::Image && atomic_image_vars_emulated.count(var.self))
+			validate_per_vertex_buffer_binding(r.secondary_index);
 
 		uint32_t var_id = var.self;
 
