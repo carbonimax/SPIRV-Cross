@@ -84,6 +84,31 @@ struct MSLShaderInterfaceVariable
 	MSLShaderVariableRate rate = MSL_SHADER_VARIABLE_RATE_PER_VERTEX;
 };
 
+// Physical scalar fields in a captured producer record, not SPIR-V buffer offsets.
+// Supported scalar types: Half, Short, UShort, Float, Int, UInt. No implicit conversion.
+struct MSLCapturedVertexComponent
+{
+	uint32_t location = 0;
+	uint32_t component = 0;
+	uint32_t byte_offset = 0;
+	SPIRType::BaseType scalar_type = SPIRType::Unknown;
+};
+
+struct MSLCapturedVertexLayout
+{
+	uint32_t stride = 0;
+	std::vector<MSLCapturedVertexComponent> components;
+};
+
+struct MSLPerVertexInputBinding
+{
+	uint32_t vertex_buffer_index = ~0u;
+	uint32_t primitive_index_buffer_index = ~0u;
+	// A private flat uint supplied by the rasterizing stage at user(locnN).
+	// Absolute triplet index, including draw/instance/view selection. It is not PrimitiveId.
+	uint32_t primitive_index_location = ~0u;
+};
+
 // Matches the binding index of a MSL resource for a binding within a descriptor set.
 // Taken together, the stage, desc_set and binding combine to form a reference to a resource
 // descriptor used in a particular shading stage. The count field indicates the number of
@@ -556,7 +581,8 @@ public:
 		// Options added for vertex output capture, PerVertexKHR inputs and tessellation evaluation as compute.
 		// They are kept at the end of the structure so that the offsets of the earlier members do not move.
 
-		// Requires MSL 4.0 and a GPU supporting vertex_value (Apple10 or later).
+		// Selects the native path: requires MSL 4.0 and vertex_value support (Apple10 or later).
+		// For older GPUs, use set_msl_per_vertex_input_buffer() instead.
 		// The caller must also ensure triangle input; MSL version alone does not imply support.
 		bool supports_per_vertex_fragment_input = false;
 
@@ -687,6 +713,21 @@ public:
 	CompilerMSL(const uint32_t *ir, size_t word_count);
 	explicit CompilerMSL(const ParsedIR &ir);
 	explicit CompilerMSL(ParsedIR &&ir);
+
+	// Opt in to portable fragment PerVertexKHR inputs (MSL >= 2.4).
+	// Mutually exclusive with supports_per_vertex_fragment_input for active PerVertex inputs.
+	// Only variable-decorated arrays of 1-3 scalar/vector values are supported; no composites.
+	// Reads record = indices[3 * privatePrimitiveIndex + vertex], then each scalar at
+	// vertices + record * layout.stride + byte_offset. All arithmetic uses ulong.
+	// Bind vertices with alignment >= 4 and indices with alignment >= 4. The caller owns
+	// bounds, capture visibility, vertex ordering, and the matching private flat varying.
+	// Indices are tightly packed uint scalars (12 bytes per triplet), NOT an array of uint3.
+	// Configure before compile(); does not generate capture/replay or infer producer layout.
+	void set_msl_per_vertex_input_buffer(const MSLCapturedVertexLayout &layout, const MSLPerVertexInputBinding &binding);
+	bool needs_per_vertex_input_buffer() const
+	{
+		return per_vertex_input_buffer_used;
+	}
 
 	// input is a shader interface variable description used to fix up shader input variables.
 	// If shader inputs are provided, is_msl_shader_input_used() will return true after
@@ -1048,6 +1089,15 @@ protected:
 
 	std::string to_tesc_invocation_id();
 	void emit_local_masked_variable(const SPIRVariable &masked_var, bool strip_array);
+	void validate_per_vertex_input_buffer();
+	void validate_per_vertex_buffer_binding(uint32_t index, uint32_t count = 1) const;
+	void add_per_vertex_input_from_buffer(const std::string &ib_var_ref, const SPIRVariable &var);
+	MSLCapturedVertexLayout per_vertex_input_layout;
+	MSLPerVertexInputBinding per_vertex_input_binding;
+	std::map<LocationComponentPair, MSLCapturedVertexComponent> per_vertex_input_components;
+	bool per_vertex_input_buffer_enabled = false;
+	bool per_vertex_input_buffer_used = false;
+
 	void add_per_vertex_input_to_interface_block(const std::string &ib_var_ref, SPIRType &ib_type, const SPIRVariable &var, const SPIRType &type, const std::string &path, uint32_t &location, uint32_t component, uint32_t vertex_count);
 	void add_variable_to_interface_block(StorageClass storage, const std::string &ib_var_ref, SPIRType &ib_type,
 	                                     SPIRVariable &var, InterfaceBlockMeta &meta);

@@ -531,6 +531,12 @@ if (SPIRV_CROSS_CLI)
 				target_link_libraries(spirv-cross-small-vector-test spirv-cross-core)
 				set_target_properties(spirv-cross-small-vector-test PROPERTIES LINK_FLAGS "${spirv-cross-link-flags}")
 
+				add_executable(spirv-cross-msl-per-vertex-input-test tests-other/msl_per_vertex_input.cpp)
+				target_link_libraries(spirv-cross-msl-per-vertex-input-test spirv-cross-msl)
+				set_target_properties(spirv-cross-msl-per-vertex-input-test PROPERTIES LINK_FLAGS "${spirv-cross-link-flags}")
+				add_test(NAME spirv-cross-msl-per-vertex-input-test
+						COMMAND $<TARGET_FILE:spirv-cross-msl-per-vertex-input-test> ${CMAKE_CURRENT_SOURCE_DIR}/tests-other/msl_per_vertex_input.spv)
+
 				add_executable(spirv-cross-msl-constexpr-test tests-other/msl_constexpr_test.cpp)
 				target_link_libraries(spirv-cross-msl-constexpr-test spirv-cross-c)
 				set_target_properties(spirv-cross-msl-constexpr-test PROPERTIES LINK_FLAGS "${spirv-cross-link-flags}")
