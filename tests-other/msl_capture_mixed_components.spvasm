@@ -1,0 +1,41 @@
+; Block and standalone arrays share a Location with disjoint Components.
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint Vertex %main "main" %lower %upper %position
+OpName %lower "lower"
+OpMemberName %Block 0 "values"
+OpName %upper "upper"
+OpMemberDecorate %Block 0 Location 0
+OpMemberDecorate %Block 0 Component 0
+OpDecorate %Block Block
+OpDecorate %upper Location 0
+OpDecorate %upper Component 2
+OpDecorate %position BuiltIn Position
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%float = OpTypeFloat 32
+%uint = OpTypeInt 32 0
+%zero = OpConstant %uint 0
+%two = OpConstant %uint 2
+%one = OpConstant %float 1
+%v2 = OpTypeVector %float 2
+%v4 = OpTypeVector %float 4
+%value = OpConstantComposite %v2 %one %one
+%pos = OpConstantComposite %v4 %one %one %one %one
+%array = OpTypeArray %v2 %two
+%values = OpConstantComposite %array %value %value
+%Block = OpTypeStruct %array
+%ptrBlock = OpTypePointer Output %Block
+%ptrArray = OpTypePointer Output %array
+%ptrV4 = OpTypePointer Output %v4
+%lower = OpVariable %ptrBlock Output
+%upper = OpVariable %ptrArray Output
+%position = OpVariable %ptrV4 Output
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%member = OpAccessChain %ptrArray %lower %zero
+OpStore %member %values
+OpStore %upper %values
+OpStore %position %pos
+OpReturn
+OpFunctionEnd
