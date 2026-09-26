@@ -223,6 +223,78 @@ static void test_mixed_components(const std::vector<uint32_t> &words, bool nativ
 	write(prefix, "-mixed-replay", replay.compile_captured_output_replay(layout, binding));
 }
 
+static void test_typed(const std::vector<uint32_t> &vertex, const std::vector<uint32_t> &fragment, bool native, bool compute, const std::string &prefix)
+{
+	CompilerMSL capture(vertex), replay(vertex), raster(vertex), consumer(fragment);
+	auto options = capture.get_msl_options();
+	options.set_msl_version(2, 4);
+	options.force_native_arrays = native;
+	options.capture_output_to_buffer = true;
+	options.vertex_for_tessellation = compute;
+	capture.set_msl_options(options);
+	auto source = capture.compile();
+	auto layout = capture.get_msl_captured_vertex_layout();
+	check(layout.stride == 176 && layout.components.size() == 46 && layout.builtins.size() == 4, "Wrong typed composite ABI.");
+	options.capture_output_to_buffer = false;
+	options.vertex_for_tessellation = false;
+	replay.set_msl_options(options);
+	raster.set_msl_options(options);
+	consumer.set_msl_options(options);
+	MSLCapturedOutputReplayBinding binding;
+	binding.vertex_buffer_index = 0;
+	binding.occurrence_buffer_index = 1;
+	binding.draw_parameters_buffer_index = 2;
+	binding.primitive_index_location = 120;
+	auto replayed = replay.compile_captured_output_replay(layout, binding);
+	auto normal = raster.compile();
+	MSLPerVertexInputBinding input;
+	input.vertex_buffer_index = 0;
+	input.primitive_index_buffer_index = 1;
+	input.primitive_index_location = 120;
+	consumer.set_msl_per_vertex_input_buffer(layout, input);
+	auto consumed = consumer.compile();
+	source += "\nstatic_assert(sizeof(main0_out) == 176, \"typed stride\");\n";
+	uint32_t checked_components = 0;
+	auto array = [&](uint32_t i) { return std::string(native ? "[" : ".elements[") + std::to_string(i) + "]"; };
+	auto leaf = [&](uint32_t location, uint32_t width, SPIRType::BaseType type, const char *scalar, uint32_t bytes, uint32_t offset, const std::string &path, uint32_t displacement, const std::string &output) {
+		std::string declaration = std::string(scalar) + (width > 1 ? std::to_string(width) : "") + " " + output + " [[user(locn" + std::to_string(location) + ")]]";
+		check(normal.find(declaration) != std::string::npos && replayed.find(declaration) != std::string::npos, "Wrong typed raster/replay linkage: " + output);
+		for (uint32_t c = 0; c < width; c++)
+		{
+			bool found = false;
+			for (const auto &field : layout.components)
+				if (field.location == location && field.component == c)
+				{
+					check(!found && field.scalar_type == type && field.byte_offset == offset + c * bytes, "Wrong typed scalar ABI: " + output);
+					found = true;
+				}
+			check(found, "Missing typed scalar: " + output);
+			std::string target = "out." + output + (width > 1 ? "[" + std::to_string(c) + "]" : "");
+			check(replayed.find(target + " = *reinterpret_cast<const device " + scalar + "*>(spvReplayRecord + " + std::to_string(offset + c * bytes) + "ul);") != std::string::npos, "Wrong typed replay load: " + output);
+			source += "static_assert(__builtin_offsetof(main0_out, " + path + ") + " + std::to_string(displacement + c * bytes) + " == " + std::to_string(offset + c * bytes) + ", \"typed offset\");\n";
+			checked_components++;
+		}
+	};
+	for (uint32_t n = 0; n < 2; n++)
+	{
+		std::string base = "typed_" + std::to_string(n) + "_";
+		std::string path = "typed" + array(n) + ".";
+		leaf(n * 10, 3, SPIRType::Half, "half", 2, n * 80, path + "h", 0, base + "h");
+		for (uint32_t a = 0; a < 2; a++)
+			leaf(n * 10 + 1 + a, 1, SPIRType::Short, "short", 2, n * 80 + 8 + a * 2, path + "s" + array(a), 0, base + "s_" + std::to_string(a));
+		leaf(n * 10 + 3, 1, SPIRType::UShort, "ushort", 2, n * 80 + 12, path + "u", 0, base + "u");
+		leaf(n * 10 + 4, 2, SPIRType::Int, "int", 4, n * 80 + 16, path + "i", 0, base + "i");
+		leaf(n * 10 + 5, 3, SPIRType::UInt, "uint", 4, n * 80 + 32, path + "j", 0, base + "j");
+		for (uint32_t col = 0; col < 4; col++)
+			leaf(n * 10 + 6 + col, 3, SPIRType::Half, "half", 2, n * 80 + 48 + col * 8, path + "m" + array(col / 2), (col % 2) * 8, base + "m_" + std::to_string(col));
+	}
+	check(checked_components == layout.components.size(), "Unchecked typed scalar.");
+	write(prefix, "-typed-capture", source);
+	write(prefix, "-typed-replay", replayed);
+	write(prefix, "-typed-raster", normal);
+	write(prefix, "-typed-fragment", consumed);
+}
+
 static void reject_specialization_array(const std::vector<uint32_t> &words, bool native, bool capture_output, bool compute)
 {
 	CompilerMSL compiler(words);
@@ -248,18 +320,21 @@ int main(int argc, char **argv)
 {
 	try
 	{
-		check(argc >= 5, "Usage: test vertex.spv fragment.spv mixed.spv spec-array.spv [output-directory]");
+		check(argc >= 7, "Usage: test vertex.spv fragment.spv mixed.spv spec-array.spv typed-vertex.spv typed-fragment.spv [output-directory]");
 		auto vertex = read_spirv(argv[1]);
 		auto fragment = read_spirv(argv[2]);
 		auto mixed = read_spirv(argv[3]);
 		auto spec_array = read_spirv(argv[4]);
+		auto typed_vertex = read_spirv(argv[5]);
+		auto typed_fragment = read_spirv(argv[6]);
 		for (bool native : {false, true})
 		{
 			for (bool compute : {false, true})
 			{
-				std::string prefix = argc > 5 ? std::string(argv[5]) + "/composites" + (native ? "-native" : "") + (compute ? "-compute" : "") : "";
+				std::string prefix = argc > 7 ? std::string(argv[7]) + "/composites" + (native ? "-native" : "") + (compute ? "-compute" : "") : "";
 				test(vertex, fragment, native, compute, prefix);
 				test_mixed_components(mixed, native, compute, prefix);
+				test_typed(typed_vertex, typed_fragment, native, compute, prefix);
 				reject_specialization_array(spec_array, native, true, compute);
 			}
 			reject_specialization_array(spec_array, native, false, false);
