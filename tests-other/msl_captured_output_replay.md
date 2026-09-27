@@ -13,6 +13,7 @@ struct MSLCapturedOutputReplayBinding
     uint32_t occurrence_buffer_index = ~0u;
     uint32_t draw_parameters_buffer_index = ~0u;
     uint32_t primitive_index_location = ~0u;
+    bool multiview_layer = false;
 };
 
 std::string compile_captured_output_replay(const MSLCapturedVertexLayout &layout, const MSLCapturedOutputReplayBinding &binding);
@@ -100,7 +101,7 @@ Record 9 is reused with different keys and corners. Both tables must contain the
 
 ## Fixups and initial limits
 
-Capture skips `CompilerMSL::emit_fixup()`, including clip-space conversion, Y inversion, default PointSize and depth/viewport emulation. Replay calls this same raster fixup emitter **exactly once** after loading captured outputs: optional `Options::vertex.fixup_clipspace`, optional reversed-depth correction, then optional `Options::vertex.flip_vert_y`. Reversed-depth correction is `Position.z = Position.w - Position.z` when the selected mask bit is set. It uses `uint(ViewportIndex)` from the captured output if present, otherwise bit zero (also when ViewportIndex is masked). The caller must supply a device-valid viewport index below 32 and bind the same mask as an equivalent ordinary VS draw; no index clamping or mask inference is performed. This supports the existing emulation path on older AMD Mac2 without requiring MSL 4.0. It never invokes application output hooks. `emulate_depth_clip_enable`, multiview and `enable_point_size_default` remain explicitly rejected. A captured application PointSize is supported; missing outputs are not silently synthesized.
+Capture skips `CompilerMSL::emit_fixup()`, including clip-space conversion, Y inversion, default PointSize and depth/viewport emulation. Replay calls this same raster fixup emitter **exactly once** after loading captured outputs: optional `Options::vertex.fixup_clipspace`, optional reversed-depth correction, then optional `Options::vertex.flip_vert_y`. Reversed-depth correction is `Position.z = Position.w - Position.z` when the selected mask bit is set. It uses `uint(ViewportIndex)` from the captured output if present, otherwise bit zero (also when ViewportIndex is masked). The caller must supply a device-valid viewport index below 32 and bind the same mask as an equivalent ordinary VS draw; no index clamping or mask inference is performed. This supports the existing emulation path on older AMD Mac2 without requiring MSL 4.0. It never invokes application output hooks. `emulate_depth_clip_enable` and `enable_point_size_default` remain explicitly rejected. Multiview requires the explicit captured-layer mode below. A captured application PointSize is supported; missing outputs are not silently synthesized.
 
 Implemented subset:
 
@@ -139,3 +140,43 @@ bash tests-other/msl_capture_replay.sh BUILD OUT
 These are CPU code-generation and MSL 2.4 syntax checks; they do not establish AMD Mac2 pipeline creation, interpolation accuracy or GPU replay execution. MoltenVK integration remains separate validation work. TES is a rejection fixture, not a supported replay stage.
 
 Producer integration verification (2026-09-26): **5/5 focused CTests**, **134 replay/capture/ordinary Metal syntax checks**, and **40 fragment Metal syntax checks** passed. All **98 legacy generated sources** are byte-identical to the pre-change snapshot. Evidence is in `build/replay-barycentric-producer/` (`ctest.log`, `metal.log`, `fragment-metal.log`, `before/`, `metal/`, `fragment-metal/`). No GPU tests were run because this host has stuck U-state processes.
+
+## Opt-in captured multiview layer
+
+Set `MSLCapturedOutputReplayBinding::multiview_layer = true` with both `Options::multiview` and `Options::multiview_layered_rendering` enabled. `view_index_from_device_index` must be false. The original vertex SPIR-V may read ViewIndex without declaring Layer: replay adds a uint `[[render_target_array_index]]` member and loads it through the existing validated builtin layout descriptor `(Layer, 0, 0)`. The captured value is **relative to this pass's attachment base view**, not an absolute Vulkan ViewIndex. Replay adds no ViewRange buffer, no draw constants and no application execution. Fragment multiview continues to reconstruct absolute ViewIndex by adding `ViewRange[0]` to its layer input.
+
+A missing, signed, out-of-bounds, overlapping or duplicate Layer descriptor fails compilation. An application-written Layer, a masked Layer or incompatible multiview options also fail. Existing unsupported-stage, buffer-slot, private-location, shape and raster-fixup guards still apply. Selection of user locations, original corner tables, both barycentric bases and position/clip/depth fixups compose with this mode. Default `multiview_layer = false` preserves the previous replay source/ABI and rejection of multiview. Ordinary non-multiview replay of an application Layer remains supported.
+
+This bool is a C++ compiler configuration field, not a GPU buffer field. Callers must include it (and the existing multiview options/layout/bindings) in converter equality, pipeline/cache identity and serialization before enabling runtime support. No C API/CLI flag, MoltenVK converter flag, cache migration or runtime admission change is supplied here.
+
+For a consecutive view group beginning at `F`, with `V > 0` views, `I` application instances and `N` original input occurrences:
+
+```text
+q = application_instance_ordinal * V + local_view
+record = q * N + occurrence
+application InstanceIndex = firstInstance + q / V
+application ViewIndex = F + q % V
+captured Layer = q % V
+```
+
+Direct capture receives Metal `instance_id = firstInstance + q` and `base_instance = firstInstance`; it binds the physical output record **before** remapping InstanceIndex. VertexIndex retains the draw's firstVertex. Indexed vertex-as-compute uses `thread_position_in_grid.y = q`, `grid_origin.y = firstInstance`, `grid_size.x = N`, and `grid_origin.x = uint32(vertexOffset)` (including signed negative offsets). View and application instance mapping depend directly on grid y, independently of SPIR-V variable declaration order. VertexIndex remains `indices[grid.x] + grid_origin.x`. Compute base builtins come from grid origin, never raster `[[base_instance]]` / `[[base_vertex]]` arguments. `enable_base_index_zero` normalizes application reads only, after view expansion is removed. Physical record addressing stays unchanged.
+
+The uint8 path remains the existing runtime **GPU widening to uint16** followed by `IndexType::UInt16`; SPIRV-Cross does not add a native Metal uint8 indexed stage-input pipeline. UInt16 and UInt32 retain their existing pointer types. No CPU index readback is introduced.
+
+The caller must expand capture dispatch/draw counts, storage, index/occurrence/key/corner tables and attribute step/divisor configuration over q. Restart compaction must retain the original per-instance `N` stride. Sparse masks are partitioned into consecutive groups: e.g. mask `0x33` gives `(F,V)=(0,2),(4,2)`; absolute view bits must not index dense capture storage. All vertices of a replay primitive must select records from the same view and carry the same absolute primitive key. Occurrence/corner addressing, replay origins and buffer layouts remain the original 8-byte pair / 4-byte corner / 16-byte draw ABI. `V`, counts, buffer bounds and products are runtime responsibilities; this compiler does not infer or allocate them. In particular, reservation reuse, multipass scheduling, attribute fetch/divisors and cache integration still require MoltenVK work before multibit admission can change.
+
+### Reproducible compiler-only checks
+
+Build the MSL library, then run:
+
+```sh
+cmake -S . -B build/multiview-prerequisites/compiler -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build/multiview-prerequisites/compiler --target spirv-cross-msl -j 4
+bash tests-other/msl_multiview_capture.sh build/multiview-prerequisites/compiler build/multiview-prerequisites/after
+```
+
+The script compiles three real Vulkan 1.1 vertex variants (the original reproducer, application side effects/base builtins/ClipDistance, ViewIndex-only) and a PerVertexKHR/both-barycentric fragment with glslang, and validates all SPIR-V with `spirv-val`. It tests direct, widened uint8, uint16 and uint32 capture, selected-view/layered rendering and zero-base emulation. Full generated MSL is syntax-checked with `macos-metal2.4`; `static_assert` checks the reflected capture stride and every scalar offset against the Metal compiler's actual struct layout.
+
+It also compiles the **actual emitted capture and replay address/mapping statements** as C++ under ASan/UBSan. Capture checks cover nonzero base instance, negative base vertex, repeated and wide indices, all legal combinations of first views `{0,4,30,31}` and view counts `{1,2,3,4,7,16,32}`, and three application instances. Replay checks cover reordered original corners, records shared between primitives, distinct view records, absolute primitive keys, nonzero occurrence/vertex/instance origins and the unchanged buffer ABI. This is CPU arithmetic and Metal syntax evidence, not GPU attribute-fetch or pipeline execution proof.
+
+For an unchanged pre-fix checkout/library, run the same test driver with final argument `before`: it skips the unavailable new API and requires six specific real Metal syntax failures (layered widened uint8/uint16/uint32, ViewIndex-only, and direct/compute zero-base cases). Save its generated default shaders to compare against the fixed compiler. Use a separate checkout/library; never revert a shared tree for this comparison.
