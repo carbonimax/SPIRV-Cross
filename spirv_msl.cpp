@@ -9703,10 +9703,11 @@ void CompilerMSL::emit_specialization_constants_and_structs()
 	ID workgroup_size_id = get_work_group_size_specialization_constants(wg_x, wg_y, wg_z);
 	if (workgroup_size_id == 0 && is_mesh_shader())
 	{
-		auto &execution = get_entry_point();
+		// LocalSizeId (SPIR-V 1.6) keeps the size in constants: a zero here makes the output loops never advance.
 		statement("constant uint3 ", builtin_to_glsl(BuiltInWorkgroupSize, StorageClassWorkgroup),
-		          " [[maybe_unused]] = ", "uint3(", execution.workgroup_size.x, ", ", execution.workgroup_size.y, ", ",
-		          execution.workgroup_size.z, ");");
+		          " [[maybe_unused]] = ", "uint3(", get_execution_mode_argument(ExecutionModeLocalSize, 0), ", ",
+		          get_execution_mode_argument(ExecutionModeLocalSize, 1), ", ",
+		          get_execution_mode_argument(ExecutionModeLocalSize, 2), ");");
 		statement("");
 	}
 
