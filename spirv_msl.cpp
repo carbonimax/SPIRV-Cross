@@ -4923,6 +4923,9 @@ void CompilerMSL::emit_local_masked_variable(const SPIRVariable &masked_var, boo
 // use the ordinary access-chain path. Only the flattened stage-in leaves use vertex_value.
 void CompilerMSL::add_per_vertex_input_to_interface_block(const string &ib_var_ref, SPIRType &ib_type, const SPIRVariable &var, const SPIRType &type, const string &path, uint32_t &location, uint32_t component, uint32_t vertex_count)
 {
+	uint32_t mesh_corners = msl_options.mesh_per_vertex_corner_locations;
+	if (mesh_corners && (is_array(type) || is_matrix(type) || type.basetype == SPIRType::Struct))
+		SPIRV_CROSS_THROW("PerVertexKHR inputs read from mesh corners must be arrays of scalars or vectors in MSL.");
 	if (is_array(type) || is_matrix(type))
 	{
 		if (is_array(type) && !type.array_size_literal.back())
@@ -4954,6 +4957,31 @@ void CompilerMSL::add_per_vertex_input_to_interface_block(const string &ib_var_r
 	uint32_t type_id = ensure_correct_input_type(type.self, location, component, 0, false);
 	if (get<SPIRType>(type_id).basetype != type.basetype)
 		SPIRV_CROSS_THROW("PerVertexKHR input type remapping is not supported in MSL.");
+	string swizzle = get<SPIRType>(type_id).vecsize != type.vecsize ? vector_swizzle(type.vecsize, 0) : "";
+	uint32_t var_id = var.self;
+	if (mesh_corners)
+	{
+		if (location >= 32 || !(mesh_corners & (1u << location)))
+			SPIRV_CROSS_THROW("PerVertexKHR input Location is missing from mesh_per_vertex_corner_locations.");
+		// One flat member per corner, written by the mesh shader in primitive index order.
+		for (uint32_t corner = 0; corner < vertex_count; corner++)
+		{
+			uint32_t member_index = uint32_t(ib_type.member_types.size());
+			ib_type.member_types.push_back(type_id);
+			set_member_name(ib_type.self, member_index, join("spvPerVertex", var.self, "_", member_index));
+			set_member_decoration(ib_type.self, member_index, DecorationLocation, location);
+			set_member_decoration(ib_type.self, member_index, DecorationComponent, component);
+			set_member_decoration(ib_type.self, member_index, DecorationFlat);
+			set_extended_member_decoration(ib_type.self, member_index, SPIRVCrossDecorationMeshPerVertexCorner, corner);
+			string member_name = to_member_name(ib_type, member_index);
+			get<SPIRFunction>(ir.default_entry_point).fixup_hooks_in.push_back([=]() {
+				statement(to_name(var_id), "[", corner, "]", path, " = ", ib_var_ref, ".", member_name, swizzle, ";");
+			});
+		}
+		mark_location_as_used_by_shader(location, get<SPIRType>(type_id), StorageClassInput);
+		location++;
+		return;
+	}
 	uint32_t member_index = uint32_t(ib_type.member_types.size());
 	ib_type.member_types.push_back(type_id);
 	set_member_name(ib_type.self, member_index, join("spvPerVertex", var.self, "_", member_index));
@@ -4963,8 +4991,6 @@ void CompilerMSL::add_per_vertex_input_to_interface_block(const string &ib_var_r
 	mark_location_as_used_by_shader(location, get<SPIRType>(type_id), StorageClassInput);
 	location++;
 	string member_name = to_member_name(ib_type, member_index);
-	string swizzle = get<SPIRType>(type_id).vecsize != type.vecsize ? vector_swizzle(type.vecsize, 0) : "";
-	uint32_t var_id = var.self;
 	get<SPIRFunction>(ir.default_entry_point).fixup_hooks_in.push_back([=]() {
 		static const char *vertices[] = { "first", "second", "third" };
 		for (uint32_t i = 0; i < vertex_count; i++)
@@ -5013,6 +5039,9 @@ void CompilerMSL::add_variable_to_interface_block(StorageClass storage, const st
 	{
 		if (get_execution_model() != ExecutionModelFragment)
 			SPIRV_CROSS_THROW("PerVertexKHR inputs are only supported in fragment shaders in MSL.");
+		bool mesh_corners = msl_options.mesh_per_vertex_corner_locations != 0;
+		if (mesh_corners && per_vertex_input_buffer_enabled)
+			SPIRV_CROSS_THROW("mesh_per_vertex_corner_locations and the PerVertexKHR input buffer are mutually exclusive.");
 		if (per_vertex_input_buffer_enabled)
 		{
 			if (!per_vertex_input_buffer_used)
@@ -5021,9 +5050,10 @@ void CompilerMSL::add_variable_to_interface_block(StorageClass storage, const st
 			add_per_vertex_input_from_buffer(ib_var_ref, var);
 			return;
 		}
-		if (!msl_options.supports_msl_version(4, 0))
+		// Mesh corners take precedence over vertex_value, which mesh pipelines do not use.
+		if (!mesh_corners && !msl_options.supports_msl_version(4, 0))
 			SPIRV_CROSS_THROW("PerVertexKHR inputs require MSL 4.0 and a GPU supporting vertex_value.");
-		if (!msl_options.supports_per_vertex_fragment_input)
+		if (!mesh_corners && !msl_options.supports_per_vertex_fragment_input)
 			SPIRV_CROSS_THROW("PerVertexKHR inputs require supports_per_vertex_fragment_input and a GPU supporting vertex_value.");
 		if (is_builtin || !is_array(var_type) || !var_type.array_size_literal.back())
 			SPIRV_CROSS_THROW("PerVertexKHR inputs in MSL must be non-builtin arrays with a literal size.");
@@ -6024,7 +6054,9 @@ uint32_t CompilerMSL::add_meshlet_block(bool per_primitive)
 		vars.push_back(&var);
 	});
 
-	if (vars.empty())
+	// The per-vertex block is built first: its PerVertexKHR corners become per-primitive values.
+	bool corners = per_primitive && msl_options.mesh_per_vertex_corner_locations;
+	if (vars.empty() && !corners)
 		return 0;
 
 	uint32_t next_id = ir.increase_bound_by(1);
@@ -6038,6 +6070,8 @@ uint32_t CompilerMSL::add_meshlet_block(bool per_primitive)
 		meta.allow_local_declaration = false;
 		add_variable_to_interface_block(StorageClassOutput, "", type, *p_var, meta);
 	}
+	if (corners)
+		add_mesh_per_vertex_corners(type);
 
 	if (per_primitive)
 		set_name(type.self, "spvPerPrimitive");
@@ -6045,6 +6079,50 @@ uint32_t CompilerMSL::add_meshlet_block(bool per_primitive)
 		set_name(type.self, "spvPerVertex");
 
 	return next_id;
+}
+
+// Adds three per-primitive members per per-vertex output at a mesh_per_vertex_corner_locations Location: the values of
+// the primitive's corners, in index order, which the fragment reads as its PerVertexKHR inputs.
+void CompilerMSL::add_mesh_per_vertex_corners(SPIRType &ib_type)
+{
+	if (!get_entry_point().flags.get(ExecutionModeOutputTrianglesEXT) || !builtin_mesh_primitive_indices_id)
+		SPIRV_CROSS_THROW("PerVertexKHR corners of mesh outputs require triangles and PrimitiveTriangleIndicesEXT.");
+	if (!mesh_out_per_vertex)
+		SPIRV_CROSS_THROW("mesh_per_vertex_corner_locations names a Location without a per-vertex mesh output.");
+	auto &vertex_type = get<SPIRType>(mesh_out_per_vertex);
+	uint32_t mask = msl_options.mesh_per_vertex_corner_locations, copied = 0;
+	for (uint32_t i = 0; i < uint32_t(vertex_type.member_types.size()); i++)
+	{
+		uint32_t orig_var = get_extended_member_decoration(vertex_type.self, i, SPIRVCrossDecorationInterfaceOrigID);
+		if (!orig_var || is_member_builtin(vertex_type, i, nullptr) || !has_member_decoration(vertex_type.self, i, DecorationLocation))
+			continue;
+		uint32_t location = get_member_decoration(vertex_type.self, i, DecorationLocation);
+		if (location >= 32 || !(mask & (1u << location)))
+			continue;
+		// Check the declared output, not the member: matrices and arrays are flattened into vector members.
+		uint32_t orig_member = get_extended_member_decoration(vertex_type.self, i, SPIRVCrossDecorationInterfaceMemberIndex);
+		auto &var_type = get_variable_element_type(get<SPIRVariable>(orig_var));
+		auto &output_type = var_type.basetype == SPIRType::Struct ? get<SPIRType>(var_type.member_types[orig_member]) : var_type;
+		if (is_array(output_type) || is_matrix(output_type) || output_type.basetype == SPIRType::Struct)
+			SPIRV_CROSS_THROW("PerVertexKHR corners of mesh outputs require scalar or vector per-vertex outputs.");
+		copied |= 1u << location;
+		for (uint32_t corner = 0; corner < 3; corner++)
+		{
+			uint32_t index = uint32_t(ib_type.member_types.size());
+			ib_type.member_types.push_back(vertex_type.member_types[i]);
+			set_member_name(ib_type.self, index, join("spvCorner", corner, "_", to_member_name(vertex_type, i)));
+			set_member_decoration(ib_type.self, index, DecorationLocation, location);
+			if (has_member_decoration(vertex_type.self, i, DecorationComponent))
+				set_member_decoration(ib_type.self, index, DecorationComponent, get_member_decoration(vertex_type.self, i, DecorationComponent));
+			set_extended_member_decoration(ib_type.self, index, SPIRVCrossDecorationInterfaceOrigID,
+			                               get_extended_member_decoration(vertex_type.self, i, SPIRVCrossDecorationInterfaceOrigID));
+			set_extended_member_decoration(ib_type.self, index, SPIRVCrossDecorationInterfaceMemberIndex,
+			                               get_extended_member_decoration(vertex_type.self, i, SPIRVCrossDecorationInterfaceMemberIndex));
+			set_extended_member_decoration(ib_type.self, index, SPIRVCrossDecorationMeshPerVertexCorner, corner);
+		}
+	}
+	if (copied != mask)
+		SPIRV_CROSS_THROW("mesh_per_vertex_corner_locations names a Location without a per-vertex mesh output.");
 }
 
 // Ensure that the type is compatible with the builtin.
@@ -15778,6 +15856,12 @@ string CompilerMSL::member_location_attribute_qualifier(const SPIRType &type, ui
 			quals += "_";
 			quals += convert_to_string(comp);
 		}
+		// Mesh outputs and fragment inputs name PerVertexKHR corners alike.
+		if (has_extended_member_decoration(type.self, index, SPIRVCrossDecorationMeshPerVertexCorner))
+		{
+			quals += "_corner";
+			quals += convert_to_string(get_extended_member_decoration(type.self, index, SPIRVCrossDecorationMeshPerVertexCorner));
+		}
 		quals += ")";
 	}
 	return quals;
@@ -22570,7 +22654,16 @@ void CompilerMSL::emit_mesh_outputs()
 						access = "." + to_member_name(orig_type, orig_id);
 					}
 				}
-				statement("spvP.", to_member_name(type_prim, index), " = ", to_name(orig_var), "[spvPI]", access, ";");
+				if (has_extended_member_decoration(type_prim.self, index, SPIRVCrossDecorationMeshPerVertexCorner))
+				{
+					// A PerVertexKHR corner: the per-vertex output of the primitive's corner, in index order.
+					static const char *const corners[] = { "x", "y", "z" };
+					uint32_t corner = get_extended_member_decoration(type_prim.self, index, SPIRVCrossDecorationMeshPerVertexCorner);
+					statement("spvP.", to_member_name(type_prim, index), " = ", to_name(orig_var), "[gl_PrimitiveTriangleIndicesEXT[spvPI].",
+					          corners[corner], "]", access, ";");
+				}
+				else
+					statement("spvP.", to_member_name(type_prim, index), " = ", to_name(orig_var), "[spvPI]", access, ";");
 			}
 			statement("spvMesh.set_primitive(spvPI, spvP);");
 		}
