@@ -2558,6 +2558,45 @@ void CompilerMSL::configure_msl_backend()
 	backend.supports_spec_constant_array_size = false;
 }
 
+string CompilerMSL::get_tessellation_factors_float32_incompatibility()
+{
+	if (!is_tesc_shader() && !is_tese_shader())
+		return "Float32 tessellation factors require TCS or raw-buffer TES.";
+	if (get_entry_point().flags.get(ExecutionModeIsolines))
+		return "Float32 tessellation factors do not support isolines.";
+	string reason;
+	ir.for_each_typed_id<SPIRVariable>([&](uint32_t, const SPIRVariable &var) {
+		if (!reason.empty() || (var.storage != StorageClassInput && var.storage != StorageClassOutput))
+			return;
+		const auto &type = get_variable_data_type(var);
+		auto builtin = BuiltIn(get_decoration(var.self, DecorationBuiltIn));
+		if (has_decoration(var.self, DecorationBuiltIn) && (builtin == BuiltInTessLevelOuter || builtin == BuiltInTessLevelInner))
+		{
+			uint32_t count = builtin == BuiltInTessLevelOuter ? 4 : 2;
+			if (type.basetype != SPIRType::Float || type.width != 32 || type.vecsize != 1 || type.columns != 1 || type.array.size() != 1 || !type.array_size_literal[0] || type.array[0] != count || !has_decoration(var.self, DecorationPatch))
+				reason = "Float32 tessellation factors require Patch float32 outer[4] and inner[2].";
+			// ponytail: single-invocation initialization; add per-patch initialization and synchronization before widening.
+			else if (var.initializer && is_tesc_shader() && get_entry_point().output_vertices != 1)
+				reason = "Float32 tessellation factor initializers currently require OutputVertices 1.";
+		}
+		for (uint32_t i = 0; reason.empty() && i < type.member_types.size(); i++)
+		{
+			auto member = BuiltIn(get_member_decoration(type.self, i, DecorationBuiltIn));
+			if (has_member_decoration(type.self, i, DecorationBuiltIn) && (member == BuiltInTessLevelOuter || member == BuiltInTessLevelInner))
+				reason = "Float32 tessellation factors require standalone builtins, not block members.";
+		}
+	});
+	ir.for_each_typed_id<SPIRFunction>([&](uint32_t, const SPIRFunction &func) {
+		for (const auto &arg : func.arguments)
+		{
+			const auto &type = get<SPIRType>(arg.type);
+			if (reason.empty() && !arg.alias_global_variable && type.pointer && (type.storage == StorageClassInput || type.storage == StorageClassOutput))
+				reason = "Float32 tessellation factors do not support explicit IO pointer function parameters.";
+		}
+	});
+	return reason;
+}
+
 string CompilerMSL::compile()
 {
 	if (captured_output_replay)
@@ -2569,12 +2608,15 @@ string CompilerMSL::compile()
 
 	if (msl_options.tessellation_factors_float32)
 	{
-		if (!is_tesc_shader() && !(is_tese_shader() && msl_options.raw_buffer_tese_input))
+		if (is_tese_shader() && !msl_options.raw_buffer_tese_input)
 			SPIRV_CROSS_THROW("Float32 tessellation factors require TCS or raw-buffer TES.");
+		auto incompatibility = get_tessellation_factors_float32_incompatibility();
+		if (!incompatibility.empty())
+			SPIRV_CROSS_THROW(incompatibility);
 		if (!msl_options.supports_msl_version(2, 0))
 			SPIRV_CROSS_THROW("Float32 tessellation factors require MSL 2.0.");
-		if (get_entry_point().flags.get(ExecutionModeIsolines) || msl_options.argument_buffers || msl_options.multiview)
-			SPIRV_CROSS_THROW("Float32 tessellation factors do not support isolines, argument buffers or multiview.");
+		if (msl_options.multiview)
+			SPIRV_CROSS_THROW("Float32 tessellation factors do not support multiview.");
 		if (msl_options.shader_tess_factor_buffer_index > 30)
 			SPIRV_CROSS_THROW("Float32 TessLevel buffer index must be in [0, 30].");
 		for (uint32_t reserved : {msl_options.indirect_params_buffer_index, msl_options.shader_output_buffer_index,
@@ -2584,35 +2626,6 @@ string CompilerMSL::compile()
 				SPIRV_CROSS_THROW("Float32 TessLevel buffer binding collides with an implicit buffer.");
 		if (is_stage_output_builtin_masked(BuiltInTessLevelOuter) || is_stage_output_builtin_masked(BuiltInTessLevelInner))
 			SPIRV_CROSS_THROW("Float32 tessellation factors do not support masked factors.");
-		ir.for_each_typed_id<SPIRVariable>([&](uint32_t, const SPIRVariable &var) {
-			if (var.storage != StorageClassInput && var.storage != StorageClassOutput)
-				return;
-			const auto &type = get_variable_data_type(var);
-			auto builtin = BuiltIn(get_decoration(var.self, DecorationBuiltIn));
-			if (has_decoration(var.self, DecorationBuiltIn) && (builtin == BuiltInTessLevelOuter || builtin == BuiltInTessLevelInner))
-			{
-				uint32_t count = builtin == BuiltInTessLevelOuter ? 4 : 2;
-				if (type.basetype != SPIRType::Float || type.width != 32 || type.vecsize != 1 || type.columns != 1 || type.array.size() != 1 || !type.array_size_literal[0] || type.array[0] != count || !has_decoration(var.self, DecorationPatch))
-					SPIRV_CROSS_THROW("Float32 tessellation factors require Patch float32 outer[4] and inner[2].");
-				// ponytail: single-invocation initialization; add per-patch initialization and synchronization before widening.
-				if (var.initializer && is_tesc_shader() && get_entry_point().output_vertices != 1)
-					SPIRV_CROSS_THROW("Float32 tessellation factor initializers currently require OutputVertices 1.");
-			}
-			for (uint32_t i = 0; i < type.member_types.size(); i++)
-			{
-				auto member = BuiltIn(get_member_decoration(type.self, i, DecorationBuiltIn));
-				if (has_member_decoration(type.self, i, DecorationBuiltIn) && (member == BuiltInTessLevelOuter || member == BuiltInTessLevelInner))
-					SPIRV_CROSS_THROW("Float32 tessellation factors require standalone builtins, not block members.");
-			}
-		});
-		ir.for_each_typed_id<SPIRFunction>([&](uint32_t, const SPIRFunction &func) {
-			for (const auto &arg : func.arguments)
-			{
-				const auto &type = get<SPIRType>(arg.type);
-				if (!arg.alias_global_variable && type.pointer && (type.storage == StorageClassInput || type.storage == StorageClassOutput))
-					SPIRV_CROSS_THROW("Float32 tessellation factors do not support explicit IO pointer function parameters.");
-			}
-		});
 	}
 
 	if (is_tese_shader() && msl_options.capture_output_to_buffer && !msl_options.tese_as_compute)

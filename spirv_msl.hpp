@@ -636,7 +636,8 @@ public:
 
 		// Opt-in TessLevel buffer ABI: float outer[4], float inner[2], 24 bytes/patch, alignment 4.
 		// TCS compute and raw TES only, MSL >= 2.0; standalone factor builtins only.
-		// No isolines, argument buffers, multiview, masked factors or explicit IO pointer parameters.
+		// No isolines, multiview, masked factors or explicit IO pointer parameters.
+		// get_tessellation_factors_float32_incompatibility() reports whether a shader qualifies.
 		// SPIR-V factor initializers require OutputVertices 1 (ordinary stores allow multiple invocations).
 		// Never bind this buffer as Metal hardware tessellation factors: convert to a separate half buffer.
 		// Integrators must include this option in their shader/pipeline cache key and version the ABI.
@@ -829,6 +830,11 @@ public:
 	// Indices are tightly packed uint scalars (12 bytes per triplet), NOT an array of uint3.
 	// Configure before compile(); does not generate capture/replay or infer producer layout.
 	void set_msl_per_vertex_input_buffer(const MSLCapturedVertexLayout &layout, const MSLPerVertexInputBinding &binding);
+
+	// Whether this TCS or TES qualifies for Options::tessellation_factors_float32 whatever the other options:
+	// empty when it does, else the reason compile() would throw. Call it after overriding execution modes,
+	// before choosing the float32 TessLevel ABI for a TCS/TES pair.
+	std::string get_tessellation_factors_float32_incompatibility();
 	bool needs_per_vertex_input_buffer() const
 	{
 		return per_vertex_input_buffer_used;

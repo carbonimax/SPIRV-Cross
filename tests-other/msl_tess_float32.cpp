@@ -147,14 +147,52 @@ int main(int argc, char **argv)
         invalid(tes, [](CompilerMSL &, CompilerMSL::Options &o) { o.raw_buffer_tese_input = false; }, "require TCS or raw-buffer TES");
         invalid(tcs, [](CompilerMSL &, CompilerMSL::Options &o) { o.set_msl_version(1, 2); }, "require MSL 2.0");
         invalid(tcs, [](CompilerMSL &c, CompilerMSL::Options &) { c.set_execution_mode(spv::ExecutionModeIsolines); }, "do not support isolines");
-        for (auto flag : {&CompilerMSL::Options::argument_buffers, &CompilerMSL::Options::multiview})
-            invalid(tcs, [&](CompilerMSL &, CompilerMSL::Options &o) { o.*flag = true; }, "do not support isolines");
+        invalid(tcs, [](CompilerMSL &, CompilerMSL::Options &o) { o.multiview = true; }, "do not support multiview");
         invalid(tcs, [](CompilerMSL &c, CompilerMSL::Options &) { c.mask_stage_output_by_builtin(spv::BuiltInTessLevelOuter); }, "masked factors");
         invalid(tcs, [](CompilerMSL &, CompilerMSL::Options &o) { o.shader_tess_factor_buffer_index = 31; }, "[0, 30]");
         invalid(tcs, [](CompilerMSL &, CompilerMSL::Options &o) { o.shader_tess_factor_buffer_index = o.shader_output_buffer_index; }, "implicit buffer");
         invalid(tcs, [](CompilerMSL &, CompilerMSL::Options &o) { o.shader_tess_factor_buffer_index = 0; }, "application or auxiliary");
         invalid(read_spirv(argv[7]), [](CompilerMSL &, CompilerMSL::Options &) {}, "require TCS or raw-buffer TES");
-        std::cout << "PASS: 16 TCS/raw-TES/copy variants, default-off option, barriers and rejection guards.\n";
+        // Argument buffers only change how descriptors reach the shader; the factor buffer stays a direct float32 argument.
+        for (const auto &words : {tcs, tes})
+        {
+            CompilerMSL compiler(words);
+            configure(compiler);
+            auto options = compiler.get_msl_options();
+            options.argument_buffers = true;
+            compiler.set_msl_options(options);
+            compiler.set_execution_mode(spv::ExecutionModeTriangles);
+            auto source = compiler.compile();
+            bool tesc = compiler.get_execution_model() == spv::ExecutionModelTessellationControl;
+            check(source.find("spvDescriptorSetBuffer0& spvDescriptorSet0") != std::string::npos, "Argument buffer was not emitted");
+            check(source.find(tesc ? "device spvTessellationFactorsFloat* spvTessLevel [[buffer(26)]]" : "const device spvTessellationFactorsFloat* spvTessLevel [[buffer(26)]]") != std::string::npos, "Float32 factor buffer lost under argument buffers");
+            check(source.find("half") == std::string::npos, "Float32 factors were narrowed under argument buffers");
+            if (argc == 9)
+            {
+                std::ofstream file(std::string(argv[8]) + (tesc ? "/tcs-argument-buffers.metal" : "/tes-argument-buffers.metal"));
+                file << source;
+                check(bool(file), "Cannot write argument-buffer MSL");
+            }
+        }
+        // The shape query agrees with compile() and ignores the other options.
+        auto incompatibility = [&](const std::vector<uint32_t> &words, const std::function<void(CompilerMSL &)> &change) {
+            CompilerMSL compiler(words);
+            auto options = compiler.get_msl_options();
+            options.argument_buffers = true;
+            options.multiview = true;
+            compiler.set_msl_options(options);
+            change(compiler);
+            return compiler.get_tessellation_factors_float32_incompatibility();
+        };
+        auto none = [](CompilerMSL &) {};
+        auto oneVertex = [](CompilerMSL &c) { c.set_execution_mode(spv::ExecutionModeOutputVertices, 1); };
+        check(incompatibility(tcs, none).empty() && incompatibility(tes, none).empty() && incompatibility(copy, oneVertex).empty(), "Qualifying shaders reported incompatible");
+        check(incompatibility(read_spirv(argv[5]), none).find("standalone builtins") != std::string::npos, "Block factors not reported");
+        check(incompatibility(read_spirv(argv[6]), none).find("explicit IO pointer") != std::string::npos, "IO pointer parameters not reported");
+        check(incompatibility(read_spirv(argv[7]), none).find("require TCS or raw-buffer TES") != std::string::npos, "Vertex stage not reported");
+        check(incompatibility(tcs, [](CompilerMSL &c) { c.set_execution_mode(spv::ExecutionModeIsolines); }).find("do not support isolines") != std::string::npos, "Isolines not reported");
+        check(incompatibility(copy, [](CompilerMSL &c) { c.set_execution_mode(spv::ExecutionModeOutputVertices, 2); }).find("initializers currently require OutputVertices 1") != std::string::npos, "Initializers not reported");
+        std::cout << "PASS: 16 TCS/raw-TES/copy variants, argument buffers, default-off option, barriers, shape query and rejection guards.\n";
     }
     catch (const std::exception &error) { std::cerr << error.what() << '\n'; return 1; }
 }

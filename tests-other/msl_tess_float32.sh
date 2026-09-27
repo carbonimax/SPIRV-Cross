@@ -15,7 +15,7 @@ for fixture in tcs tes copy tes-copy; do
         xcrun metal -x metal -std=macos-metal2.4 -fno-modules -fsyntax-only "$output/$fixture$mode.metal" > "$output/$fixture$mode.syntax.log" 2>&1
     done
 done
-for fixture in reversed-disabled reversed-distinct reversed-tcs; do
+for fixture in reversed-disabled reversed-distinct reversed-tcs tcs-argument-buffers tes-argument-buffers; do
     xcrun metal -x metal -std=macos-metal2.4 -fno-modules -fsyntax-only "$output/$fixture.metal" > "$output/$fixture.syntax.log" 2>&1
 done
 "$build/spirv-cross" "$build/msl_tess_float32.tesc.spv" --msl --msl-version 20400 --msl-tessellation-factors-float32 --output "$output/cli.metal"
@@ -25,4 +25,4 @@ xcrun metal -x metal -std=macos-metal2.4 -fno-modules -fsyntax-only "$output/cli
 cmp "$output/before-half.metal" "$output/after-half.metal"
 xcrun clang++ -std=c++14 -fobjc-arc -framework Foundation -framework Metal "$root/tests-other/msl_tess_float32_runtime.mm" -o "$output/runtime" > "$output/runtime-build.log" 2>&1
 MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1 "$output/runtime" "$output" 2>&1 | tee "$output/runtime.log"
-echo 'PASS: 20 Metal syntax checks, CLI, default half comparison and GPU precision/ABI control.'
+echo 'PASS: 22 Metal syntax checks, CLI, default half comparison and GPU precision/ABI control.'
