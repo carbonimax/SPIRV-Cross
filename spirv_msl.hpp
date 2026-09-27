@@ -401,6 +401,12 @@ public:
 		// We can evade this restriction by ANDing the internal sample_mask output
 		// of the shader with the additional fixed sample mask.
 		uint32_t additional_fixed_sample_mask = 0xffffffff;
+		// Bitmask of the user Locations (0 to 31) that the fragment shader of a mesh pipeline reads as PerVertexKHR.
+		// A triangle mesh shader copies its scalar or vector per-vertex outputs at these Locations into three
+		// per-primitive values, the corners in primitive index order; a fragment shader reads its PerVertexKHR
+		// inputs, which must be arrays of scalars or vectors, from these flat values instead of vertex_value or a
+		// captured buffer. Set the same mask on both stages. Each copied output adds three values per primitive.
+		uint32_t mesh_per_vertex_corner_locations = 0;
 		bool enable_point_size_builtin = true;
 		bool enable_point_size_default = false;
 		float default_point_size = 1.0f;
@@ -1184,6 +1190,7 @@ protected:
 	uint32_t add_interface_block(StorageClass storage, bool patch = false);
 	uint32_t add_interface_block_pointer(uint32_t ib_var_id, StorageClass storage);
 	uint32_t add_meshlet_block(bool per_primitive);
+	void add_mesh_per_vertex_corners(SPIRType &ib_type);
 
 	struct InterfaceBlockMeta
 	{
