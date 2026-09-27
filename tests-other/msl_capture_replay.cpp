@@ -565,7 +565,8 @@ int main(int argc, char **argv)
 		rejects([&]() { no_position.compile_captured_output_replay(simple_layout, binding); }, "Position output");
 		CompilerMSL tese(tessellation);
 		configure(tese);
-		rejects([&]() { tese.compile_captured_output_replay(simple_layout, binding); }, "only vertex entry points");
+		auto tese_replay = tese.compile_captured_output_replay(simple_layout, binding);
+		check(tese_replay.find("vertex ") != std::string::npos && tese_replay.find("[[ patch(") == std::string::npos, "TES replay did not emit a raster vertex function");
 		CompilerMSL matrix(unsupported);
 		configure(matrix);
 		rejects([&]() { matrix.compile_captured_output_replay(simple_layout, binding); }, "physical scalar type mismatch");
