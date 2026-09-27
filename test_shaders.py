@@ -263,6 +263,9 @@ def cross_compile_msl(shader, spirv, opt, iterations, paths):
         elif '.pervertex-points.' in shader:
             msl_args.append('--msl-per-vertex-primitive-vertex-count')
             msl_args.append('1')
+    if '.meshcorners.' in shader:
+        # PerVertexKHR corners at Locations 0 and 3, as in tests-other/msl_mesh_per_vertex_corners.*.
+        msl_args += ['--msl-mesh-per-vertex-corner-locations', '9']
     if not '.nomain.' in shader:
         msl_args.append('--entry')
         msl_args.append('main')

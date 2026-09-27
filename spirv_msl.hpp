@@ -626,6 +626,13 @@ public:
 		// Requires MSL 3.2 or above, and has no effect with earlier MSL versions.
 		bool use_fast_math_pragmas = false;
 
+		// Bitmask of the user Locations (0 to 31) that the fragment shader of a mesh pipeline reads as PerVertexKHR.
+		// A triangle mesh shader copies its scalar or vector per-vertex outputs at these Locations into three
+		// per-primitive values, the corners in primitive index order; a fragment shader reads its PerVertexKHR
+		// inputs, which must be arrays of scalars or vectors, from these flat values instead of vertex_value or a
+		// captured buffer. Set the same mask on both stages. Each copied output adds three values per primitive.
+		uint32_t mesh_per_vertex_corner_locations = 0;
+
 		// Enables PerVertexKHR fragment inputs, emitted as vertex_value<T>.
 		// Requires MSL 4.0 and a GPU supporting vertex_value (Apple10 or later);
 		// the MSL version alone does not imply support.
@@ -1199,6 +1206,7 @@ protected:
 	uint32_t add_interface_block(StorageClass storage, bool patch = false);
 	uint32_t add_interface_block_pointer(uint32_t ib_var_id, StorageClass storage);
 	uint32_t add_meshlet_block(bool per_primitive);
+	void add_mesh_per_vertex_corners(SPIRType &ib_type);
 
 	struct InterfaceBlockMeta
 	{

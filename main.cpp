@@ -643,6 +643,7 @@ struct CLIArguments
 	bool msl_capture_output_to_buffer = false;
 	bool msl_supports_per_vertex_fragment_input = false;
 	uint32_t msl_per_vertex_primitive_vertex_count = 3;
+	uint32_t msl_mesh_per_vertex_corner_locations = 0;
 	bool msl_swizzle_texture_samples = false;
 	bool msl_ios = false;
 	bool msl_pad_fragment_output = false;
@@ -1010,6 +1011,8 @@ static void print_help_msl()
 	                "\t[--msl-disable-rasterization]:\n\t\tDisables rasterization and returns void from vertex-like entry points.\n"
 	                "\t[--msl-supports-per-vertex-fragment-input]:\n\t\tEnable PerVertexKHR triangle inputs. Requires MSL 4.0 and a GPU supporting vertex_value (Apple10 or later).\n"
 	                "\t[--msl-per-vertex-primitive-vertex-count <count>]:\n\t\tVertices per rasterized primitive (3 triangles, 2 lines, 1 points). PerVertexKHR reads past it return the last vertex, as in Vulkan.\n"
+	                "\t[--msl-mesh-per-vertex-corner-locations <mask>]:\n\t\tCopy the mesh per-vertex outputs at these Locations into per-primitive corners, and read\n"
+	                "\t\tfragment PerVertexKHR inputs from them. Set the same mask for the mesh and the fragment shader.\n"
 	                "\t[--msl-auto-disable-rasterization]:\n\t\tDisables rasterization if BuiltInPosition is not written.\n"
 	                "\t[--msl-default-point-size <size>]:\n\t\tApplies a default value if BuiltInPointSize is not written.\n");
 	// clang-format on
@@ -1276,6 +1279,7 @@ static string compile_iteration(const CLIArguments &args, std::vector<uint32_t> 
 		msl_opts.capture_output_to_buffer = args.msl_capture_output_to_buffer;
 		msl_opts.supports_per_vertex_fragment_input = args.msl_supports_per_vertex_fragment_input;
 		msl_opts.per_vertex_primitive_vertex_count = args.msl_per_vertex_primitive_vertex_count;
+		msl_opts.mesh_per_vertex_corner_locations = args.msl_mesh_per_vertex_corner_locations;
 		msl_opts.swizzle_texture_samples = args.msl_swizzle_texture_samples;
 		msl_opts.invariant_float_math = args.msl_invariant_float_math;
 		if (args.msl_ios)
@@ -1787,6 +1791,8 @@ static int main_inner(int argc, char *argv[])
 	        [&args](CLIParser &) { args.msl_supports_per_vertex_fragment_input = true; });
 	cbs.add("--msl-per-vertex-primitive-vertex-count",
 	        [&args](CLIParser &parser) { args.msl_per_vertex_primitive_vertex_count = parser.next_uint(); });
+	cbs.add("--msl-mesh-per-vertex-corner-locations",
+	        [&args](CLIParser &parser) { args.msl_mesh_per_vertex_corner_locations = parser.next_uint(); });
 	cbs.add("--msl-swizzle-texture-samples", [&args](CLIParser &) { args.msl_swizzle_texture_samples = true; });
 	cbs.add("--msl-ios", [&args](CLIParser &) { args.msl_ios = true; });
 	cbs.add("--msl-pad-fragment-output", [&args](CLIParser &) { args.msl_pad_fragment_output = true; });

@@ -669,6 +669,22 @@ if (SPIRV_CROSS_CLI)
 				add_test(NAME spirv-cross-msl-per-vertex-members-test
 						COMMAND $<TARGET_FILE:spirv-cross-msl-per-vertex-input-test> ${CMAKE_CURRENT_SOURCE_DIR}/tests-other/msl_per_vertex_input_members.spv --reject "Member-decorated PerVertexKHR")
 
+				set(mesh-corner-fixtures)
+				foreach(fixture BASE.mesh MATRIX.mesh LINES.mesh BASE.frag BLOCK.frag MATRIX.frag)
+					string(REGEX REPLACE "\\..*" "" define ${fixture})
+					string(REGEX REPLACE ".*\\." "" stage ${fixture})
+					set(binary ${CMAKE_CURRENT_BINARY_DIR}/msl_mesh_per_vertex_corners_${fixture}.spv)
+					add_custom_command(OUTPUT ${binary}
+							COMMAND ${spirv-cross-glslang} -V --target-env vulkan1.3 -D${define} ${CMAKE_CURRENT_SOURCE_DIR}/tests-other/msl_mesh_per_vertex_corners.${stage} -o ${binary}
+							COMMAND ${spirv-cross-spirv-val} --target-env vulkan1.3 ${binary}
+							DEPENDS tests-other/msl_mesh_per_vertex_corners.${stage} VERBATIM)
+					list(APPEND mesh-corner-fixtures ${binary})
+				endforeach()
+				add_executable(spirv-cross-msl-mesh-corners-test tests-other/msl_mesh_per_vertex_corners.cpp ${mesh-corner-fixtures})
+				target_link_libraries(spirv-cross-msl-mesh-corners-test spirv-cross-msl)
+				set_target_properties(spirv-cross-msl-mesh-corners-test PROPERTIES LINK_FLAGS "${spirv-cross-link-flags}")
+				add_test(NAME spirv-cross-msl-mesh-corners-test COMMAND $<TARGET_FILE:spirv-cross-msl-mesh-corners-test> ${mesh-corner-fixtures})
+
 				add_executable(spirv-cross-msl-constexpr-test tests-other/msl_constexpr_test.cpp)
 				target_link_libraries(spirv-cross-msl-constexpr-test spirv-cross-c)
 				set_target_properties(spirv-cross-msl-constexpr-test PROPERTIES LINK_FLAGS "${spirv-cross-link-flags}")
