@@ -1,0 +1,17 @@
+#version 450
+#extension GL_EXT_mesh_shader : require
+// SPIR-V 1.6 declares the workgroup size with LocalSizeId; the output loops must still advance by four threads.
+layout(local_size_x = 4) in;
+layout(triangles, max_vertices = 8, max_primitives = 4) out;
+layout(location = 0) out vec4 vColor[];
+
+void main()
+{
+	uint i = gl_LocalInvocationIndex;
+	SetMeshOutputsEXT(8, 4);
+	gl_MeshVerticesEXT[i].gl_Position = vec4(float(i));
+	gl_MeshVerticesEXT[i + 4].gl_Position = vec4(float(i + 4));
+	vColor[i] = vec4(1.0);
+	vColor[i + 4] = vec4(0.5);
+	gl_PrimitiveTriangleIndicesEXT[i] = uvec3(i, i + 1, i + 2) % 8;
+}

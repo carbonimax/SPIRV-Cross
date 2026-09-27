@@ -257,6 +257,9 @@ def cross_compile_msl(shader, spirv, opt, iterations, paths):
     msl_args.append(path_to_msl_standard_cli(shader))
     if '.pervertex.' in shader:
         msl_args.append('--msl-supports-per-vertex-fragment-input')
+    if '.meshcorners.' in shader:
+        # PerVertexKHR corners at Locations 0 and 3, as in tests-other/msl_mesh_per_vertex_corners.*.
+        msl_args += ['--msl-mesh-per-vertex-corner-locations', '9']
     if not '.nomain.' in shader:
         msl_args.append('--entry')
         msl_args.append('main')
