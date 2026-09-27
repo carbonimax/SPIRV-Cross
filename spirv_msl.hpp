@@ -143,6 +143,10 @@ struct MSLPerVertexInputBinding
 	// A private flat uint supplied by the rasterizing stage at user(locnN).
 	// Absolute triplet index, including draw/instance/view selection. It is not PrimitiveId.
 	uint32_t primitive_index_location = ~0u;
+	// Optional buffer of one uint per triplet. When set, a fragment PrimitiveId reads it at the triplet index
+	// instead of [[primitive_id]]: after tessellation, Vulkan's PrimitiveId is the patch index, whereas the
+	// replayed draw only knows its triangle index.
+	uint32_t primitive_id_buffer_index = ~0u;
 };
 
 // Private float3 varyings carrying the same one-hot basis at triangle corners 0, 1, 2.
@@ -1290,6 +1294,7 @@ protected:
 	bool is_sample_rate() const;
 	bool is_intersection_query() const;
 	bool is_direct_input_builtin(BuiltIn builtin);
+	bool uses_per_vertex_primitive_id_buffer() const;
 	std::string builtin_qualifier(BuiltIn builtin);
 	std::string builtin_type_decl(BuiltIn builtin, uint32_t id = 0);
 	std::string built_in_func_arg(BuiltIn builtin, bool prefix_comma);
