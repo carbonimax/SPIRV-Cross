@@ -630,6 +630,28 @@ public:
 		// The caller must also ensure triangle input; MSL version alone does not imply support.
 		bool supports_per_vertex_fragment_input = false;
 
+		// Opt-in TessLevel buffer ABI: float outer[4], float inner[2], 24 bytes/patch, alignment 4.
+		// TCS compute and raw TES only, MSL >= 2.0; standalone factor builtins only.
+		// No isolines, argument buffers, multiview, masked factors or explicit IO pointer parameters.
+		// SPIR-V factor initializers require OutputVertices 1 (ordinary stores allow multiple invocations).
+		// Never bind this buffer as Metal hardware tessellation factors: convert to a separate half buffer.
+		// Integrators must include this option in their shader/pipeline cache key and version the ABI.
+		bool tessellation_factors_float32 = false;
+
+		// Opt-in TES capture kernel (MSL >= 2.4, triangle/equal-spacing only).
+		// Requires raw_buffer_tese_input, capture_output_to_buffer and a nonzero
+		// OutputVertices execution-mode override giving the input patch size.
+		// indirect_params_buffer_index binds a read-only uint buffer: a four-word
+		// header (invocation count, three reserved zeros), then eight words per invocation:
+		// float xyz bit patterns, patch ID, dense output record index, three reserved zeros.
+		// Dispatch x selects an invocation; excess x and nonzero y/z return before record access.
+		// For ordered per-corner capture, set record index = invocation index; triangle p then
+		// refers to records [3*p, 3*p+1, 3*p+2]. Coordinates and patch IDs are interleaved, not separate arrays.
+		// Coordinates are SPIR-V domain coordinates, with no implicit winding/origin transform.
+		// Caller owns valid coordinates, all buffer bounds/alignment, unique dense records,
+		// synchronization and topology. Patch inputs retain the raw TES input ABI.
+		bool tese_as_compute = false;
+
 		bool is_ios() const
 		{
 			return platform == iOS;
@@ -758,7 +780,7 @@ public:
 	explicit CompilerMSL(const ParsedIR &ir);
 	explicit CompilerMSL(ParsedIR &&ir);
 
-	// Query after successful vertex compilation with capture_output_to_buffer enabled.
+	// Query after successful vertex or tese_as_compute compilation with capture_output_to_buffer enabled.
 	// Returns the physical stride of the final emitted record (including builtins/padding),
 	// and user Location/Component scalar fields suitable for set_msl_per_vertex_input_buffer().
 	// Builtin scalar fields are exported separately for replay; unused Component packing lanes are omitted.
