@@ -153,6 +153,25 @@ int main(int argc, char **argv)
                 fragment.set_msl_per_vertex_input_buffer(layout, fragmentBinding);
                 auto fragmentSource = fragment.compile();
                 check(fragment.needs_per_vertex_input_buffer() && fragmentSource.find("spvPerVertexIndices") != std::string::npos, "TES fragment did not consume PerVertex records");
+                // A fragment PrimitiveId reads the per-triplet patch table when one is bound, else [[primitive_id]].
+                auto primitiveFragment = [&](const std::vector<uint32_t> &spirv, uint32_t table) {
+                    CompilerMSL compiler(spirv);
+                    compiler.set_msl_options(fragmentOptions);
+                    auto binding = fragmentBinding;
+                    binding.primitive_id_buffer_index = table;
+                    compiler.set_msl_per_vertex_input_buffer(layout, binding);
+                    return compiler.compile();
+                };
+                auto primitiveWords = read_spirv(directory + "/msl_tese_pervertex_primitive.spv");
+                auto primitiveSource = primitiveFragment(primitiveWords, 2);
+                check(primitiveSource.find("const device uint* spvPerVertexPrimitiveIds [[buffer(2)]]") != std::string::npos &&
+                      primitiveSource.find("uint gl_PrimitiveID = spvPerVertexPrimitiveIds[in.spvPerVertexPrimitive];") != std::string::npos &&
+                      primitiveSource.find("[[primitive_id]]") == std::string::npos, "Fragment PrimitiveId did not read the patch table");
+                auto rasterizedSource = primitiveFragment(primitiveWords, ~0u);
+                check(rasterizedSource.find("[[primitive_id]]") != std::string::npos && rasterizedSource.find("spvPerVertexPrimitiveIds") == std::string::npos, "Fragment PrimitiveId without a table changed");
+                check(primitiveFragment(read_spirv(argv[3]), 2) == fragmentSource, "An unused PrimitiveId table changed the fragment");
+                for (uint32_t table : {fragmentBinding.vertex_buffer_index, fragmentBinding.primitive_index_buffer_index, 31u})
+                    rejects([&]() { primitiveFragment(primitiveWords, table); }, "PrimitiveId buffer requires a distinct Metal buffer index");
                 if (argc > 4)
                 {
                     std::ofstream replayFile(std::string(argv[4]) + "/tese-replay.metal");
@@ -161,6 +180,9 @@ int main(int argc, char **argv)
                     std::ofstream fragmentFile(std::string(argv[4]) + "/tese-pervertex.metal");
                     fragmentFile << fragmentSource;
                     check(bool(fragmentFile), "Cannot write TES PerVertex fragment MSL evidence");
+                    std::ofstream primitiveFile(std::string(argv[4]) + "/tese-pervertex-primitive.metal");
+                    primitiveFile << primitiveSource;
+                    check(bool(primitiveFile), "Cannot write TES PerVertex PrimitiveId MSL evidence");
                 }
             }
             if (argc > 4)

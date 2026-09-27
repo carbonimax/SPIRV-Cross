@@ -17,6 +17,7 @@ done
 xcrun metal -x metal -std=macos-metal2.4 -fno-modules -fsyntax-only "$root/tests-other/msl_tese_topology.metal" > "$output/topology-syntax.log" 2>&1
 xcrun metal -x metal -std=macos-metal2.4 -fno-modules -fsyntax-only "$output/tese-replay.metal" > "$output/tese-replay-syntax.log" 2>&1
 xcrun metal -x metal -std=macos-metal2.4 -fno-modules -fsyntax-only "$output/tese-pervertex.metal" > "$output/tese-pervertex-syntax.log" 2>&1
+xcrun metal -x metal -std=macos-metal2.4 -fno-modules -fsyntax-only "$output/tese-pervertex-primitive.metal" > "$output/tese-pervertex-primitive-syntax.log" 2>&1
 "$build/spirv-cross" "$build/msl_tese_compute_triangle.spv" --msl --msl-version 20400 --msl-raw-buffer-tese-input --msl-capture-output --msl-tese-as-compute 3 --output "$output/cli.metal"
 xcrun metal -x metal -std=macos-metal2.4 -fno-modules -fsyntax-only "$output/cli.metal" > "$output/cli-syntax.log" 2>&1
 if "$build/spirv-cross" "$build/msl_tese_compute_triangle.spv" --msl --msl-version 20400 --msl-capture-output > "$output/legacy-after.log" 2>&1; then
@@ -28,4 +29,4 @@ for fixture in triangle block; do
     "$output/runtime" "$output" "$fixture" "$root/tests-other/msl_tese_topology.metal" 2>&1 | tee "$output/runtime-$fixture.log"
     "$output/runtime" "$output" "$fixture" "$root/tests-other/msl_tese_topology.metal" 3 2>&1 | tee "$output/runtime-$fixture-factor3.log"
 done
-echo 'PASS: eight Metal 2.4 syntax checks including TES replay/PerVertex fragment, CLI rejection and GPU-produced TES rendering at factors 1/2 and 1/3.'
+echo 'PASS: nine Metal 2.4 syntax checks including TES replay/PerVertex fragment, CLI rejection and GPU-produced TES rendering at factors 1/2 and 1/3.'

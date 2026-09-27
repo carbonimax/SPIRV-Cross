@@ -512,6 +512,12 @@ void CompilerMSL::set_msl_per_vertex_input_buffer(const MSLCapturedVertexLayout 
 	per_vertex_input_buffer_enabled = true;
 }
 
+bool CompilerMSL::uses_per_vertex_primitive_id_buffer() const
+{
+	return get_execution_model() == ExecutionModelFragment && per_vertex_input_buffer_enabled &&
+	       per_vertex_input_binding.primitive_id_buffer_index != ~0u;
+}
+
 void CompilerMSL::set_msl_fragment_barycentric_input(const MSLFragmentBarycentricInputBinding &binding)
 {
 	if (msl_compile_started)
@@ -745,6 +751,10 @@ void CompilerMSL::validate_per_vertex_input_buffer()
 		SPIRV_CROSS_THROW("Portable PerVertexKHR requires two distinct Metal buffer indices in [0, 30].");
 	if (binding.primitive_index_location == k_unknown_location)
 		SPIRV_CROSS_THROW("Portable PerVertexKHR requires a private primitive index Location.");
+	if (binding.primitive_id_buffer_index != ~0u &&
+	    (binding.primitive_id_buffer_index > 30 || binding.primitive_id_buffer_index == binding.vertex_buffer_index ||
+	     binding.primitive_id_buffer_index == binding.primitive_index_buffer_index))
+		SPIRV_CROSS_THROW("Portable PerVertexKHR PrimitiveId buffer requires a distinct Metal buffer index in [0, 30].");
 	if (!per_vertex_input_layout.stride || per_vertex_input_layout.components.empty())
 		SPIRV_CROSS_THROW("Portable PerVertexKHR requires a nonzero producer stride and scalar layout.");
 	per_vertex_input_components.clear();
@@ -796,7 +806,8 @@ void CompilerMSL::validate_per_vertex_buffer_binding(uint32_t index, uint32_t co
 		SPIRV_CROSS_THROW("Float32 TessLevel buffer binding collides with an application or auxiliary buffer.");
 	if (!per_vertex_input_buffer_used)
 		return;
-	for (uint32_t reserved : { per_vertex_input_binding.vertex_buffer_index, per_vertex_input_binding.primitive_index_buffer_index })
+	for (uint32_t reserved : { per_vertex_input_binding.vertex_buffer_index, per_vertex_input_binding.primitive_index_buffer_index,
+	                           per_vertex_input_binding.primitive_id_buffer_index })
 		if (index <= reserved && reserved - index < count)
 			SPIRV_CROSS_THROW(join("Portable PerVertexKHR buffer index ", reserved, " collides with another fragment buffer."));
 }
@@ -16206,6 +16217,8 @@ bool CompilerMSL::is_direct_input_builtin(BuiltIn bi_type)
 {
 	if (msl_options.tese_as_compute && (bi_type == BuiltInPrimitiveId || bi_type == BuiltInTessCoord))
 		return false;
+	if (bi_type == BuiltInPrimitiveId && uses_per_vertex_primitive_id_buffer())
+		return false;
 	switch (bi_type)
 	{
 	// Vertex function in
@@ -16294,6 +16307,8 @@ void CompilerMSL::entry_point_args_builtin(string &ep_args)
 		if (!ep_args.empty())
 			ep_args += ", ";
 		ep_args += join("const device uchar* spvPerVertexVertices [[buffer(", per_vertex_input_binding.vertex_buffer_index, ")]], const device uint* spvPerVertexIndices [[buffer(", per_vertex_input_binding.primitive_index_buffer_index, ")]]");
+		if (uses_per_vertex_primitive_id_buffer() && active_input_builtins.get(BuiltInPrimitiveId))
+			ep_args += join(", const device uint* spvPerVertexPrimitiveIds [[buffer(", per_vertex_input_binding.primitive_id_buffer_index, ")]]");
 	}
 
 	depth_clip_viewport_idx_var_name = "";
@@ -17197,6 +17212,16 @@ void CompilerMSL::fix_up_shader_inputs_outputs()
 				});
 				break;
 			case BuiltInPrimitiveId:
+				if (uses_per_vertex_primitive_id_buffer())
+				{
+					if (!per_vertex_input_buffer_used)
+						SPIRV_CROSS_THROW("Portable PerVertexKHR PrimitiveId buffer requires PerVertexKHR inputs.");
+					entry_func.fixup_hooks_in.push_back([=]() {
+						statement(builtin_type_decl(bi_type), " ", to_expression(var_id), " = spvPerVertexPrimitiveIds[",
+						          stage_in_var_name, ".spvPerVertexPrimitive];");
+					});
+					break;
+				}
 				// This is natively supported by fragment and tessellation evaluation shaders.
 				// In tessellation control shaders, this is direct-mapped without multi-patch workgroups.
 				if (!is_tesc_shader() || !msl_options.multi_patch_workgroup)
