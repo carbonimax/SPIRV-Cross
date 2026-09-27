@@ -118,6 +118,12 @@ struct MSLCapturedOutputReplayBinding
 	uint32_t occurrence_buffer_index = ~0u;
 	uint32_t draw_parameters_buffer_index = ~0u;
 	uint32_t primitive_index_location = ~0u;
+	// Import the captured synthetic Layer into the raster interface. Requires layered
+	// multiview options and a uint Layer in the layout, even if the SPIR-V has no Layer.
+	// Layer is relative to this pass's first view. No extra buffer or draw constants.
+	// Caller must include this opt-in in cache identity and expand capture/occurrence
+	// tables over physical instance/view pairs. Defaults preserve legacy replay.
+	bool multiview_layer = false;
 };
 
 // Optional replay output matching MSLFragmentBarycentricInputBinding. Occurrence

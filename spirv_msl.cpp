@@ -225,7 +225,9 @@ string CompilerMSL::compile_captured_output_replay_impl(const MSLCapturedVertexL
 		SPIRV_CROSS_THROW("Captured output replay requires MSL 2.4 or later.");
 	if (msl_options.capture_output_to_buffer || msl_options.vertex_for_tessellation || msl_options.disable_rasterization)
 		SPIRV_CROSS_THROW("Captured output replay requires a normal rasterizing vertex configuration.");
-	if (msl_options.multiview || msl_options.view_index_from_device_index || msl_options.emulate_depth_clip_enable || msl_options.enable_point_size_default)
+	if (binding.multiview_layer && (!msl_options.multiview || !msl_options.multiview_layered_rendering || msl_options.view_index_from_device_index || is_stage_output_builtin_masked(BuiltInLayer)))
+		SPIRV_CROSS_THROW("Captured output replay multiview Layer requires layered multiview, no device index and an unmasked Layer.");
+	if ((msl_options.multiview && !binding.multiview_layer) || msl_options.view_index_from_device_index || msl_options.emulate_depth_clip_enable || msl_options.enable_point_size_default)
 		SPIRV_CROSS_THROW("Captured output replay does not support multiview, depth-clip emulation or synthesized default PointSize.");
 	if (binding.vertex_buffer_index > 30 || binding.occurrence_buffer_index > 30 || binding.draw_parameters_buffer_index > 30 || binding.vertex_buffer_index == binding.occurrence_buffer_index || binding.vertex_buffer_index == binding.draw_parameters_buffer_index || binding.occurrence_buffer_index == binding.draw_parameters_buffer_index)
 		SPIRV_CROSS_THROW("Captured output replay requires three distinct Metal buffer indices in [0, 30].");
@@ -302,6 +304,8 @@ string CompilerMSL::compile_captured_output_replay_impl(const MSLCapturedVertexL
 			SPIRV_CROSS_THROW("Captured output replay layout has duplicate builtin array element/component.");
 		validate_scalar(field.scalar_type, field.byte_offset);
 	}
+	if (binding.multiview_layer && !builtins.count(std::make_tuple(BuiltInLayer, 0u, 0u)))
+		SPIRV_CROSS_THROW("Captured output replay multiview requires a captured Layer.");
 	std::set<uint32_t> selected_locations;
 	if (user_locations)
 	{
@@ -346,6 +350,8 @@ string CompilerMSL::compile_captured_output_replay_impl(const MSLCapturedVertexL
 	sync_entry_point_aliases_and_names();
 	build_function_control_flow_graphs_and_analyze();
 	update_active_builtins();
+	if (binding.multiview_layer && active_output_builtins.get(BuiltInLayer))
+		SPIRV_CROSS_THROW("Captured output replay multiview requires a synthetic Layer, not an application Layer output.");
 	active_output_builtins.for_each_bit([&](uint32_t builtin) {
 		if (!supported_builtin(BuiltIn(builtin)))
 			SPIRV_CROSS_THROW(join("Captured output replay does not support output builtin ", builtin, "."));
@@ -384,6 +390,13 @@ string CompilerMSL::compile_captured_output_replay_impl(const MSLCapturedVertexL
 	auto &uint_type = set<SPIRType>(uint_id, OpTypeInt);
 	uint_type.basetype = SPIRType::UInt;
 	uint_type.width = 32;
+	if (binding.multiview_layer)
+	{
+		uint32_t layer_member = uint32_t(output.member_types.size());
+		output.member_types.push_back(uint_id);
+		set_member_name(output.self, layer_member, "spvReplayLayer");
+		set_member_decoration(output.self, layer_member, DecorationBuiltIn, BuiltInLayer);
+	}
 	uint32_t key_member = uint32_t(output.member_types.size());
 	captured_output_replay_key_member = key_member;
 	output.member_types.push_back(uint_id);
