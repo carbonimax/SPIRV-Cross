@@ -640,6 +640,12 @@ if (SPIRV_CROSS_CLI)
 						COMMAND ${spirv-cross-spirv-val} --target-env vulkan1.1 ${tese_pervertex_fixture}
 						DEPENDS tests-other/msl_tese_pervertex.frag VERBATIM)
 				list(APPEND tese-compute-fixtures ${tese_pervertex_fixture})
+				set(tese_pervertex_primitive_fixture ${CMAKE_CURRENT_BINARY_DIR}/msl_tese_pervertex_primitive.spv)
+				add_custom_command(OUTPUT ${tese_pervertex_primitive_fixture}
+						COMMAND ${spirv-cross-glslang} -V --target-env vulkan1.1 ${CMAKE_CURRENT_SOURCE_DIR}/tests-other/msl_tese_pervertex_primitive.frag -o ${tese_pervertex_primitive_fixture}
+						COMMAND ${spirv-cross-spirv-val} --target-env vulkan1.1 ${tese_pervertex_primitive_fixture}
+						DEPENDS tests-other/msl_tese_pervertex_primitive.frag VERBATIM)
+				list(APPEND tese-compute-fixtures ${tese_pervertex_primitive_fixture})
 				add_executable(spirv-cross-msl-tese-compute-test tests-other/msl_tese_compute.cpp ${tese-compute-fixtures})
 				target_link_libraries(spirv-cross-msl-tese-compute-test spirv-cross-msl)
 				add_test(NAME spirv-cross-msl-tese-compute-test COMMAND $<TARGET_FILE:spirv-cross-msl-tese-compute-test> ${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/tests-other/msl_capture_layout_simple.spv ${tese_pervertex_fixture})
