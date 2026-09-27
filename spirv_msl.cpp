@@ -10719,10 +10719,10 @@ bool CompilerMSL::access_chain_needs_stage_io_builtin_translation(uint32_t base)
 	if (!var || !is_tessellation_shader())
 		return true;
 
-	// Arrayed TES inputs use flattened member names; non-arrayed builtin blocks use direct builtin names.
+	// Arrayed TES inputs use flattened member names; stage I/O remapping may strip their array but retain parent_type.
 	const auto &type = get_variable_data_type(*var);
 	return is_tese_shader() && (var->storage == StorageClassOutput ||
-	                           (var->storage == StorageClassInput && has_decoration(type.self, DecorationBlock) && type.array.empty()));
+	                           (var->storage == StorageClassInput && has_decoration(type.self, DecorationBlock) && type.array.empty() && !type.parent_type));
 }
 
 // Sets the interface member index for an access chain to a pull-model interpolant.
