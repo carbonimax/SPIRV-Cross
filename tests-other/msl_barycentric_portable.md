@@ -14,7 +14,7 @@ compiler.set_msl_fragment_barycentric_input(barycentrics);
 std::string msl = compiler.compile();
 ```
 
-Configure before compilation. Only active builtins require a location; the other may remain `~0u`. When both are active, reserve distinct locations. Private locations must not collide with active application inputs (including matrix columns, Component inputs and captured PerVertex inputs), any `add_msl_shader_input` mapping at that location, or the active `MSLPerVertexInputBinding::primitive_index_location`. Locations are not auto-allocated or exposed as application inputs by `is_msl_shader_input_used()`. Original SPIR-V BuiltIn reflection is retained. Include the opt-in and both locations in shader/pipeline cache identity.
+Configure before compilation. Only active builtins require a location; the other may remain `~0u`. When both are active, reserve distinct locations. Private locations must not collide with active application inputs (including matrix columns, Component inputs and captured PerVertex inputs), any non-builtin `add_msl_shader_input` mapping at that location (a builtin mapping occupies no user Location), or the active `MSLPerVertexInputBinding::primitive_index_location`. Locations are not auto-allocated or exposed as application inputs by `is_msl_shader_input_used()`. Original SPIR-V BuiltIn reflection is retained. Include the opt-in and both locations in shader/pipeline cache identity.
 
 ## Producer contract
 
