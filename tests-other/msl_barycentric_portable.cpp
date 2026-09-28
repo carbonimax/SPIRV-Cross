@@ -456,6 +456,16 @@ int main(int argc, char **argv)
 		mapping.component = 2;
 		mapped.add_msl_shader_input(mapping);
 		rejects([&]() { mapped.compile(); }, "Portable barycentric private Location collides with an MSL shader input mapping.");
+		// A builtin mapping at the same location field occupies no user Location (MoltenVK maps gl_PerVertex members
+		// with their member index there): the private Location stays available.
+		CompilerMSL builtin_mapped(plain);
+		configure(builtin_mapped);
+		builtin_mapped.set_msl_fragment_barycentric_input(binding());
+		MSLShaderInterfaceVariable builtin_mapping;
+		builtin_mapping.location = 12;
+		builtin_mapping.builtin = spv::BuiltInPointSize;
+		builtin_mapped.add_msl_shader_input(builtin_mapping);
+		check(builtin_mapped.compile().find("user(locn12)") != std::string::npos, "A builtin mapping blocked the private barycentric Location.");
 		for (auto decoration : {spv::DecorationFlat, spv::DecorationPatch, spv::DecorationPerVertexKHR, spv::DecorationNoPerspective})
 		{
 			CompilerMSL compiler(pull);

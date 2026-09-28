@@ -5943,8 +5943,9 @@ uint32_t CompilerMSL::add_interface_block(StorageClass storage, bool patch)
 				SPIRV_CROSS_THROW("Portable barycentric private Location collides with a fragment input.");
 			if (per_vertex_input_buffer_used && location == per_vertex_input_binding.primitive_index_location)
 				SPIRV_CROSS_THROW("Portable barycentric private Location collides with the PerVertexKHR primitive key.");
+			// A builtin mapping occupies no user Location, whatever its location field holds.
 			for (const auto &input : inputs_by_location)
-				if (input.first.location == location)
+				if (input.first.location == location && input.second.builtin == BuiltInMax)
 					SPIRV_CROSS_THROW("Portable barycentric private Location collides with an MSL shader input mapping.");
 		}
 	}
