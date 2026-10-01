@@ -65,15 +65,12 @@ void spvSetMeshOutputsEXT(uint gl_LocalInvocationIndex, threadgroup uint2& spvMe
 struct gl_MeshPerVertexEXT
 {
     float4 gl_Position [[position]];
-    float gl_PointSize [[point_size]];
 };
 
 constant uint3 gl_WorkGroupSize [[maybe_unused]] = uint3(1u);
 
 struct gl_MeshPerPrimitiveEXT
 {
-    uint gl_Layer [[render_target_array_index]];
-    uint gl_ViewportIndex [[viewport_array_index]];
 };
 
 struct spvPerVertex
@@ -126,6 +123,8 @@ void _4(threadgroup spvUnsafeArray<gl_MeshPerVertexEXT, 1>& gl_MeshVerticesEXT, 
     {
         spvMesh.set_index(spvPI, gl_PrimitivePointIndicesEXT[spvPI]);
         spvPerPrimitive spvP = {};
+        spvP.gl_Layer = 0u;
+        spvP.gl_ViewportIndex = 0u;
         spvMesh.set_primitive(spvPI, spvP);
     }
 }
