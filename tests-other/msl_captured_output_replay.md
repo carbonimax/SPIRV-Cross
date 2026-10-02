@@ -139,8 +139,6 @@ bash tests-other/msl_capture_replay.sh BUILD OUT
 
 These are CPU code-generation and MSL 2.4 syntax checks; they do not establish AMD Mac2 pipeline creation, interpolation accuracy or GPU replay execution. MoltenVK integration remains separate validation work. TES is a rejection fixture, not a supported replay stage.
 
-Producer integration verification (2026-09-26): **5/5 focused CTests**, **134 replay/capture/ordinary Metal syntax checks**, and **40 fragment Metal syntax checks** passed. All **98 legacy generated sources** are byte-identical to the pre-change snapshot. Evidence is in `build/replay-barycentric-producer/` (`ctest.log`, `metal.log`, `fragment-metal.log`, `before/`, `metal/`, `fragment-metal/`). No GPU tests were run because this host has stuck U-state processes.
-
 ## Opt-in captured multiview layer
 
 Set `MSLCapturedOutputReplayBinding::multiview_layer = true` with both `Options::multiview` and `Options::multiview_layered_rendering` enabled. `view_index_from_device_index` must be false. The original vertex SPIR-V may read ViewIndex without declaring Layer: replay adds a uint `[[render_target_array_index]]` member and loads it through the existing validated builtin layout descriptor `(Layer, 0, 0)`. The captured value is **relative to this pass's attachment base view**, not an absolute Vulkan ViewIndex. Replay adds no ViewRange buffer, no draw constants and no application execution. Fragment multiview continues to reconstruct absolute ViewIndex by adding `ViewRange[0]` to its layer input.
