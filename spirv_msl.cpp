@@ -2575,7 +2575,7 @@ string CompilerMSL::get_tessellation_factors_float32_incompatibility()
 			uint32_t count = builtin == BuiltInTessLevelOuter ? 4 : 2;
 			if (type.basetype != SPIRType::Float || type.width != 32 || type.vecsize != 1 || type.columns != 1 || type.array.size() != 1 || !type.array_size_literal[0] || type.array[0] != count || !has_decoration(var.self, DecorationPatch))
 				reason = "Float32 tessellation factors require Patch float32 outer[4] and inner[2].";
-			// ponytail: single-invocation initialization; add per-patch initialization and synchronization before widening.
+			// Initialization is done by a single invocation; widening needs per-patch initialization and synchronization.
 			else if (var.initializer && is_tesc_shader() && get_entry_point().output_vertices != 1)
 				reason = "Float32 tessellation factor initializers currently require OutputVertices 1.";
 		}
@@ -10760,7 +10760,7 @@ void CompilerMSL::fix_up_interpolant_access_chain(const uint32_t *ops, uint32_t 
 		set_extended_decoration(ops[1], SPIRVCrossDecorationInterpolantComponentExpr, get_extended_decoration(ops[2], SPIRVCrossDecorationInterpolantComponentExpr));
 	for (uint32_t i = 3; i < length; ++i)
 	{
-		// ponytail: reject nested offsets until pull-model lowering tracks composite strides.
+		// Nested offsets are rejected until pull-model lowering tracks composite strides.
 		if (fragment_barycentric_input_enabled && (type->array.size() > 1 || (!type->array.empty() && (type->columns > 1 || type->basetype == SPIRType::Struct)) || (type->basetype == SPIRType::Struct && (i != 3 || has_extended_decoration(ops[2], SPIRVCrossDecorationInterfaceMemberIndex)))))
 			SPIRV_CROSS_THROW("Portable barycentric explicit interpolation does not support nested input composites.");
 		if (is_vector(*type) && !is_array(*type) && is_scalar(result_type))
