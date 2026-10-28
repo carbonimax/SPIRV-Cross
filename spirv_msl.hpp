@@ -503,8 +503,15 @@ public:
 		bool capture_output_to_buffer = false;
 		// Selects the native path: requires MSL 4.0 and vertex_value support (Apple10 or later).
 		// For older GPUs, use set_msl_per_vertex_input_buffer() instead.
-		// The caller must also ensure triangle input; MSL version alone does not imply support.
+		// The MSL version alone does not imply support.
 		bool supports_per_vertex_fragment_input = false;
+
+		// Number of vertices in the primitives rasterized with the fragment shader:
+		// 3 for triangles, 2 for lines, 1 for points.
+		// Metal returns zero for missing vertices, whereas Vulkan returns the valid vertex
+		// with the highest index, so PerVertexKHR reads past this count are redirected to it.
+		// Only used with supports_per_vertex_fragment_input.
+		uint32_t per_vertex_primitive_vertex_count = 3;
 		bool mesh_shader_emulation = false;
 		bool swizzle_texture_samples = false;
 		bool tess_domain_origin_lower_left = false;

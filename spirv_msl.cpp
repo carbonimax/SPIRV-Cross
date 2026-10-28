@@ -5815,10 +5815,14 @@ void CompilerMSL::add_per_vertex_input_to_interface_block(const string &ib_var_r
 	mark_location_as_used_by_shader(location, get<SPIRType>(type_id), StorageClassInput);
 	location++;
 	string member_name = to_member_name(ib_type, member_index);
+	uint32_t primitive_vertex_count = msl_options.per_vertex_primitive_vertex_count;
 	get<SPIRFunction>(ir.default_entry_point).fixup_hooks_in.push_back([=]() {
+		// Metal returns zero for vertices the primitive does not have, while Vulkan returns
+		// the valid vertex with the highest index.
 		static const char *vertices[] = { "first", "second", "third" };
 		for (uint32_t i = 0; i < vertex_count; i++)
-			statement(to_name(var_id), "[", i, "]", path, " = ", ib_var_ref, ".", member_name, ".get(vertex_index::", vertices[i], ")", swizzle, ";");
+			statement(to_name(var_id), "[", i, "]", path, " = ", ib_var_ref, ".", member_name,
+			          ".get(vertex_index::", vertices[min(i, primitive_vertex_count - 1)], ")", swizzle, ";");
 	});
 }
 
@@ -5879,6 +5883,9 @@ void CompilerMSL::add_variable_to_interface_block(StorageClass storage, const st
 			SPIRV_CROSS_THROW("PerVertexKHR inputs require MSL 4.0 and a GPU supporting vertex_value.");
 		if (!mesh_corners && !msl_options.supports_per_vertex_fragment_input)
 			SPIRV_CROSS_THROW("PerVertexKHR inputs require supports_per_vertex_fragment_input and a GPU supporting vertex_value.");
+		if (!mesh_corners && (msl_options.per_vertex_primitive_vertex_count == 0 ||
+		                      msl_options.per_vertex_primitive_vertex_count > 3))
+			SPIRV_CROSS_THROW("per_vertex_primitive_vertex_count must be 1, 2 or 3.");
 		if (is_builtin || !is_array(var_type) || !var_type.array_size_literal.back())
 			SPIRV_CROSS_THROW("PerVertexKHR inputs in MSL must be non-builtin arrays with a literal size.");
 		uint32_t vertex_count = to_array_size_literal(var_type);
