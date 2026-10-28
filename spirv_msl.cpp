@@ -18575,7 +18575,7 @@ void CompilerMSL::entry_point_args_builtin(string &ep_args)
 			ep_args +=
 			    join("constant uint* spvIndirectParams [[buffer(", msl_options.indirect_params_buffer_index, ")]]");
 		}
-		else if (stage_out_var_id &&
+		else if (stage_out_var_id && !msl_options.tese_as_compute &&
 		         !(get_execution_model() == ExecutionModelVertex && msl_options.vertex_for_tessellation))
 		{
 			if (!ep_args.empty())
