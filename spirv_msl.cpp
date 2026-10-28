@@ -18523,6 +18523,23 @@ void CompilerMSL::entry_point_args_builtin(string &ep_args)
 	if (needs_base_instance_arg == TriState::Yes)
 		ep_args += built_in_func_arg(BuiltInBaseInstance, !ep_args.empty());
 
+	if (needs_depth_clip_state_buffer())
+	{
+		if (get_execution_model() == ExecutionModelFragment && msl_options.supports_msl_version(2, 0) &&
+		    depth_clip_viewport_idx_var_name.empty())
+		{
+			if (!ep_args.empty())
+				ep_args += ", ";
+			depth_clip_viewport_idx_var_name = "spvDepthClipViewportIndex";
+			ep_args += "uint spvDepthClipViewportIndex [[viewport_array_index]]";
+		}
+
+		if (!ep_args.empty())
+			ep_args += ", ";
+		ep_args += join("constant spvDepthClipState& spvDepthClipState [[buffer(",
+		                msl_options.depth_clip_state_buffer_index, ")]]");
+	}
+
 	if (msl_options.emulate_reversed_depth_viewport && stage_out_var_id && !capture_output_to_buffer &&
 	    is_vertex_like_shader() && !qual_pos_var_name.empty())
 	{
