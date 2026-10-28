@@ -667,7 +667,7 @@ if (SPIRV_CROSS_CLI)
 				add_test(NAME spirv-cross-msl-per-vertex-composites-test
 						COMMAND $<TARGET_FILE:spirv-cross-msl-per-vertex-input-test> ${CMAKE_CURRENT_SOURCE_DIR}/tests-other/msl_per_vertex_input_composites.spv --composites)
 				add_test(NAME spirv-cross-msl-per-vertex-members-test
-						COMMAND $<TARGET_FILE:spirv-cross-msl-per-vertex-input-test> ${CMAKE_CURRENT_SOURCE_DIR}/tests-other/msl_per_vertex_input_members.spv --reject "Member-decorated PerVertexKHR")
+						COMMAND $<TARGET_FILE:spirv-cross-msl-per-vertex-input-test> ${CMAKE_CURRENT_SOURCE_DIR}/tests-other/msl_per_vertex_input_members.spv --reject "PerVertexKHR decoration is not supported in MSL.")
 
 				set(mesh-corner-fixtures)
 				foreach(fixture BASE.mesh MATRIX.mesh LINES.mesh BASE.frag BLOCK.frag MATRIX.frag)
